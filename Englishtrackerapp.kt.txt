@@ -1,0 +1,2465 @@
+package com.vibe.englishtracker
+
+import android.app.Application
+import android.content.Context
+import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.room.*
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import java.time.LocalDate
+import java.util.Locale
+import kotlin.math.max
+import kotlin.math.roundToInt
+
+// ============================================================================
+// 1. МОДЕЛИ ДАННЫХ И УРОВНИ CEFR (A0-A1 .. C1-C2, OXFORD + MURPHY)
+// ============================================================================
+
+enum class EnglishDialect(val label: String, val shortLabel: String, val flag: String) {
+    US("American English (US)", "US", "🇺🇸"),
+    UK("British English (UK)", "UK", "🇬🇧")
+}
+
+enum class CefrLevel(
+    val code: String,
+    val title: String,
+    val murphyBook: String,
+    val oxfordTargetQuota: Int // Целевой норматив слов Oxford 3000/5000 для уровня
+) {
+    A0_A1(
+        code = "A0–A1",
+        title = "Beginner / Elementary",
+        murphyBook = "Essential Grammar in Use (Red Murphy • Ч. 1)",
+        oxfordTargetQuota = 900
+    ),
+    A2(
+        code = "A2",
+        title = "Pre-Intermediate",
+        murphyBook = "Essential Grammar in Use (Red Murphy • Ч. 2)",
+        oxfordTargetQuota = 850
+    ),
+    B1(
+        code = "B1",
+        title = "Intermediate",
+        murphyBook = "English Grammar in Use (Blue Murphy • Ч. 1)",
+        oxfordTargetQuota = 800
+    ),
+    B2(
+        code = "B2",
+        title = "Upper-Intermediate",
+        murphyBook = "English Grammar in Use (Blue Murphy • Ч. 2)",
+        oxfordTargetQuota = 750
+    ),
+    C1_C2(
+        code = "C1–C2",
+        title = "Advanced / Mastery",
+        murphyBook = "Advanced Grammar in Use (Green Murphy / Hewings)",
+        oxfordTargetQuota = 1700
+    );
+
+    companion object {
+        fun fromCode(code: String): CefrLevel =
+            entries.find { it.code == code } ?: A0_A1
+    }
+}
+
+/**
+ * Слово из словаря Oxford 3000/5000, жестко связанное с карточками Anki.
+ * Правило закрытия уровня: слово считается полностью закрытым (isMastered = true)
+ * ТОЛЬКО тогда, когда пользователь сдал его в Anki на «Идеально» [REQUIRED_PERFECT_STREAK] раз подряд без ошибок.
+ */
+@Entity(tableName = "oxford_words")
+data class OxfordWordEntity(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val levelCode: String,          // "A0–A1", "A2", "B1", "B2", "C1–C2"
+    val wordUs: String,             // Написание в American English
+    val wordUk: String,             // Написание в British English
+    val ipaUs: String,              // Транскрипция US (IPA)
+    val ipaUk: String,              // Транскрипция UK (IPA)
+    val partOfSpeech: String,       // noun, verb, adj, adv, phrasal verb
+    val translationRu: String,      // Перевод на русский (показывается после ответа в Anki)
+    val exampleUs: String,          // Пример предложения (US)
+    val exampleUk: String,          // Пример предложения (UK)
+    val exampleRu: String,          // Перевод примера на русский
+    // Поля интервального повторения Anki (SM-2) и идеальной сдачи:
+    val perfectStreak: Int = 0,     // Серия идеальных ответов подряд (нужно 3/3 для закрытия слова)
+    val intervalDays: Int = 0,      // Текущий интервал в днях
+    val easeFactor: Float = 2.5f,   // Коэффициент легкости SM-2
+    val nextReviewEpochDay: Long = 0L, // День следующего показа (LocalDate.toEpochDay())
+    val totalReviews: Int = 0,
+    val lastResultCorrect: Boolean? = null
+) {
+    companion object {
+        const val REQUIRED_PERFECT_STREAK = 3
+    }
+
+    val isMasteredInAnki: Boolean
+        get() = perfectStreak >= REQUIRED_PERFECT_STREAK
+
+    val masteryFraction: Float
+        get() = (perfectStreak.toFloat() / REQUIRED_PERFECT_STREAK.toFloat()).coerceIn(0f, 1f)
+
+    fun displayWord(dialect: EnglishDialect): String =
+        if (dialect == EnglishDialect.US) wordUs else wordUk
+
+    fun displayIpa(dialect: EnglishDialect): String =
+        if (dialect == EnglishDialect.US) ipaUs else ipaUk
+
+    fun displayExample(dialect: EnglishDialect): String =
+        if (dialect == EnglishDialect.US) exampleUs else exampleUk
+}
+
+/**
+ * Юнит из книг Raymond Murphy (Red, Blue, Green Murphy).
+ */
+@Entity(tableName = "murphy_units")
+data class MurphyUnitEntity(
+    @PrimaryKey val unitId: String, // Например "RED_U1", "BLUE_U42", "GREEN_U85"
+    val levelCode: String,          // "A0–A1", "A2", "B1", "B2", "C1–C2"
+    val bookTitle: String,          // Книга Мёрфи
+    val unitNumber: Int,            // Номер юнита по книге
+    val titleEn: String,            // Название темы в оригинале
+    val descriptionRu: String,      // Пояснение на русском
+    val isCompleted: Boolean = false
+)
+
+/**
+ * Профиль прогресса: часы занятий, стрики, выбранный диалект US/UK.
+ */
+@Entity(tableName = "user_stats")
+data class UserStatsEntity(
+    @PrimaryKey val id: Int = 1,
+    val totalMinutesStudied: Int = 0,
+    val currentStreakDays: Int = 1,
+    val longestStreakDays: Int = 1,
+    val lastStudyEpochDay: Long = LocalDate.now().toEpochDay(),
+    val selectedDialect: String = EnglishDialect.US.name,
+    val totalAnkiReviews: Int = 0
+)
+
+/**
+ * Медаль / Достижение за пройденный путь.
+ */
+data class MedalItem(
+    val id: String,
+    val title: String,
+    val description: String,
+    val categoryLabel: String,
+    val isUnlocked: Boolean,
+    val progressText: String,
+    val progressFraction: Float
+)
+
+/**
+ * Сводка прогресса по конкретному уровню CEFR.
+ */
+data class LevelProgressSummary(
+    val level: CefrLevel,
+    val totalUnits: Int,
+    val completedUnits: Int,
+    val grammarPercent: Int,
+    val totalWordsInDb: Int,
+    val masteredWordsInAnki: Int,
+    val vocabAnkiPercent: Int,       // Строго на основе идеальной сдачи слов в Anki
+    val overallPercent: Int,         // Итоговый % уровня (50% Мёрфи + 50% Anki Oxford)
+    val isVocabFullyClosed: Boolean, // true только если ВСЕ слова уровня сданы идеально (3/3)
+    val isLevelFullyClosed: Boolean  // true если 100% Мёрфи И 100% слов идеально в Anki
+)
+
+// ============================================================================
+// 2. ROOM DAO И БАЗА ДАННЫХ
+// ============================================================================
+
+@Dao
+interface TrackerDao {
+    @Query("SELECT * FROM oxford_words ORDER BY id ASC")
+    fun observeAllWords(): Flow<List<OxfordWordEntity>>
+
+    @Query("SELECT COUNT(*) FROM oxford_words")
+    suspend fun getWordCount(): Int
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertWords(words: List<OxfordWordEntity>)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertWord(word: OxfordWordEntity)
+
+    @Update
+    suspend fun updateWord(word: OxfordWordEntity)
+
+    @Query("SELECT * FROM murphy_units ORDER BY unitNumber ASC")
+    fun observeAllUnits(): Flow<List<MurphyUnitEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertUnits(units: List<MurphyUnitEntity>)
+
+    @Update
+    suspend fun updateUnit(unit: MurphyUnitEntity)
+
+    @Query("SELECT * FROM user_stats WHERE id = 1")
+    fun observeStats(): Flow<UserStatsEntity?>
+
+    @Query("SELECT * FROM user_stats WHERE id = 1")
+    suspend fun getStatsOnce(): UserStatsEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun saveStats(stats: UserStatsEntity)
+}
+
+@Database(
+    entities = [OxfordWordEntity::class, MurphyUnitEntity::class, UserStatsEntity::class],
+    version = 1,
+    exportSchema = false
+)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun trackerDao(): TrackerDao
+
+    companion object {
+        @Volatile
+        private var INSTANCE: AppDatabase? = null
+
+        fun getInstance(context: Context): AppDatabase {
+            return INSTANCE ?: synchronized(this) {
+                val instance = Room.databaseBuilder(
+                    context.applicationContext,
+                    AppDatabase::class.java,
+                    "oxford_murphy_tracker.db"
+                ).build()
+                INSTANCE = instance
+                instance
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 3. ПРЕДЗАПОЛНЕННАЯ БАЗА: КНИГИ МЁРФИ (A0–C2) И СЛОВАРЬ OXFORD (US + UK)
+// ============================================================================
+
+object SeedData {
+
+    fun getInitialMurphyUnits(): List<MurphyUnitEntity> = listOf(
+        // A0–A1: Red Murphy (Essential Grammar in Use, Part 1)
+        MurphyUnitEntity("RED_U1", "A0–A1", "Red Murphy • Essential Grammar", 1, "Unit 1–2: am / is / are (Present Simple be)", "Глагол to be в настоящем времени: утверждения и вопросы"),
+        MurphyUnitEntity("RED_U3", "A0–A1", "Red Murphy • Essential Grammar", 3, "Unit 3–4: I am doing (Present Continuous)", "Настоящее длительное время: действие прямо сейчас"),
+        MurphyUnitEntity("RED_U5", "A0–A1", "Red Murphy • Essential Grammar", 5, "Unit 5–7: I do / work / like (Present Simple)", "Настоящее простое время: регулярные действия и факты"),
+        MurphyUnitEntity("RED_U8", "A0–A1", "Red Murphy • Essential Grammar", 8, "Unit 8: I am doing vs. I do", "Сравнение Present Continuous и Present Simple"),
+        MurphyUnitEntity("RED_U10", "A0–A1", "Red Murphy • Essential Grammar", 10, "Unit 10–12: was / were & I worked (Past Simple)", "Прошедшее простое время: правильные и неправильные глаголы"),
+        MurphyUnitEntity("RED_U15", "A0–A1", "Red Murphy • Essential Grammar", 15, "Unit 15–17: I have done (Present Perfect Basics)", "Настоящее совершенное время: связь прошлого с настоящим"),
+        MurphyUnitEntity("RED_U30", "A0–A1", "Red Murphy • Essential Grammar", 30, "Unit 30–33: can / could / must / should", "Базовые модальные глаголы способности и совета"),
+        MurphyUnitEntity("RED_U37", "A0–A1", "Red Murphy • Essential Grammar", 37, "Unit 37–39: there is / there are / there was", "Конструкции наличия предмета в пространстве и времени"),
+
+        // A2: Red Murphy (Essential Grammar in Use, Part 2)
+        MurphyUnitEntity("RED_U13", "A2", "Red Murphy • Essential Grammar", 13, "Unit 13–14: I was doing (Past Continuous) vs. I did", "Прошедшее длительное на фоне краткого действия"),
+        MurphyUnitEntity("RED_U19", "A2", "Red Murphy • Essential Grammar", 19, "Unit 19–20: for / since / ago & Present Perfect vs. Past", "Разграничение Present Perfect и Past Simple по маркерам времени"),
+        MurphyUnitEntity("RED_U21", "A2", "Red Murphy • Essential Grammar", 21, "Unit 21–22: is done / was done (Passive Voice Basics)", "Страдательный залог в настоящем и прошлом"),
+        MurphyUnitEntity("RED_U26", "A2", "Red Murphy • Essential Grammar", 26, "Unit 26–28: I'm going to vs. will / shall", "Способы выражения будущего: планы и спонтанные решения"),
+        MurphyUnitEntity("RED_U87", "A2", "Red Murphy • Essential Grammar", 87, "Unit 87–90: older / the oldest / not as...as", "Степени сравнения прилагательных и наречий"),
+        MurphyUnitEntity("RED_U99", "A2", "Red Murphy • Essential Grammar", 99, "Unit 99–100: If I do... & If I did... (Conditionals 1 & 2)", "Условные предложения реального и нереального типа"),
+        MurphyUnitEntity("RED_U101", "A2", "Red Murphy • Essential Grammar", 101, "Unit 101–102: a person who... a thing that/which...", "Определительные придаточные предложения (Relative Clauses)"),
+        MurphyUnitEntity("RED_U114", "A2", "Red Murphy • Essential Grammar", 114, "Unit 114–115: Phrasal Verbs (go in, fall off, put on)", "Базовые фразовые глаголы движения и повседневных действий"),
+
+        // B1: Blue Murphy (English Grammar in Use, Part 1)
+        MurphyUnitEntity("BLUE_U9", "B1", "Blue Murphy • English Grammar in Use", 9, "Unit 9–10: I have been doing vs. I have done", "Present Perfect Continuous и фокус на длительности процесса"),
+        MurphyUnitEntity("BLUE_U15", "B1", "Blue Murphy • English Grammar in Use", 15, "Unit 15–16: I had done & I had been doing (Past Perfect)", "Предпрошедшее время и длительность до момента в прошлом"),
+        MurphyUnitEntity("BLUE_U18", "B1", "Blue Murphy • English Grammar in Use", 18, "Unit 18 & 61: used to do vs. be/get used to doing", "Привычки в прошлом и привыкание к новому в настоящем"),
+        MurphyUnitEntity("BLUE_U28", "B1", "Blue Murphy • English Grammar in Use", 28, "Unit 28–30: must / can't / might have done", "Модальные глаголы вероятности и дедукции в прошлом"),
+        MurphyUnitEntity("BLUE_U42", "B1", "Blue Murphy • English Grammar in Use", 42, "Unit 42–45: Passive Voice (is being done / has been done)", "Сложные формы пассивного залога и безличные конструкции"),
+        MurphyUnitEntity("BLUE_U46", "B1", "Blue Murphy • English Grammar in Use", 46, "Unit 46: have something done (Causative)", "Каузативная конструкция (услуги, выполняемые другими)"),
+        MurphyUnitEntity("BLUE_U47", "B1", "Blue Murphy • English Grammar in Use", 47, "Unit 47–48: He said that... (Reported Speech)", "Косвенная речь, согласование времен и косвенные вопросы"),
+        MurphyUnitEntity("BLUE_U53", "B1", "Blue Murphy • English Grammar in Use", 53, "Unit 53–58: Verb + -ing vs. Verb + to-infinitive", "Герундий и инфинитив со сменой и без смены значения"),
+
+        // B2: Blue Murphy (English Grammar in Use, Part 2)
+        MurphyUnitEntity("BLUE_U24", "B2", "Blue Murphy • English Grammar in Use", 24, "Unit 24: will be doing & will have done", "Future Continuous и Future Perfect для проекции в будущее"),
+        MurphyUnitEntity("BLUE_U39", "B2", "Blue Murphy • English Grammar in Use", 39, "Unit 39–41: If I had known... & I wish I had known", "Third Conditional, смешанные условия и сожаления (wish / if only)"),
+        MurphyUnitEntity("BLUE_U68", "B2", "Blue Murphy • English Grammar in Use", 68, "Unit 68: Participle Clauses (-ing and -ed clauses)", "Причастные обороты (Feeling tired, I went to bed)"),
+        MurphyUnitEntity("BLUE_U72", "B2", "Blue Murphy • English Grammar in Use", 72, "Unit 72–78: Articles & Abstract Uncountables", "Тонкости употребления the / a / zero article с абстрактными понятиями"),
+        MurphyUnitEntity("BLUE_U92", "B2", "Blue Murphy • English Grammar in Use", 92, "Unit 92–96: Non-defining Relative Clauses (whose, whom, where)", "Пунктуация и структура распространенных придаточных"),
+        MurphyUnitEntity("BLUE_U113", "B2", "Blue Murphy • English Grammar in Use", 113, "Unit 113–118: Conjunctions (although, despite, in case, unless)", "Сложные союзы уступки, условия и предосторожности"),
+        MurphyUnitEntity("BLUE_U137", "B2", "Blue Murphy • English Grammar in Use", 137, "Unit 137–145: Advanced Phrasal Verbs in Context", "Многозначные фразовые глаголы с out, off, up, down, away"),
+
+        // C1–C2: Green Murphy / Hewings (Advanced Grammar in Use)
+        MurphyUnitEntity("GREEN_U24", "C1–C2", "Green Murphy • Advanced Grammar in Use", 24, "Unit 24–25: Passive Reporting & Ergative Verbs", "Академический пассив и эргативные глаголы (The door opened)"),
+        MurphyUnitEntity("GREEN_U35", "C1–C2", "Green Murphy • Advanced Grammar in Use", 35, "Unit 35: Subjunctive & Unreal Past (It's high time / Were it to)", "Сослагательное наклонение в формальном и дипломатическом регистре"),
+        MurphyUnitEntity("GREEN_U60", "C1–C2", "Green Murphy • Advanced Grammar in Use", 60, "Unit 60–65: Substitution & Ellipsis (so do I, do so, leaving out words)", "Эллипсис и субституция для естественной беглой речи"),
+        MurphyUnitEntity("GREEN_U85", "C1–C2", "Green Murphy • Advanced Grammar in Use", 85, "Unit 85–87: Discourse Markers & Hedging", "Маркеры дискурса, академическая осторожность и связность текста"),
+        MurphyUnitEntity("GREEN_U98", "C1–C2", "Green Murphy • Advanced Grammar in Use", 98, "Unit 98: Cleft Sentences (What I need is... / It was... who)", "Эмфатические конструкции расщепления для смыслового акцента"),
+        MurphyUnitEntity("GREEN_U99", "C1–C2", "Green Murphy • Advanced Grammar in Use", 99, "Unit 99–100: Inversion (Never have I seen / Little did she know)", "Инверсия после отрицательных и ограничительных наречий")
+    )
+
+    fun getInitialOxfordWords(): List<OxfordWordEntity> = listOf(
+        // ==================== УРОВЕНЬ A0–A1 (Oxford 3000 Core) ====================
+        OxfordWordEntity(
+            levelCode = "A0–A1",
+            wordUs = "color",
+            wordUk = "colour",
+            ipaUs = "/ˈkʌl.ɚ/",
+            ipaUk = "/ˈkʌl.ə(r)/",
+            partOfSpeech = "noun",
+            translationRu = "цвет, оттенок",
+            exampleUs = "What is your favorite color?",
+            exampleUk = "What is your favourite colour?",
+            exampleRu = "Какой твой любимый цвет?"
+        ),
+        OxfordWordEntity(
+            levelCode = "A0–A1",
+            wordUs = "apartment",
+            wordUk = "flat",
+            ipaUs = "/əˈpɑːrt.mənt/",
+            ipaUk = "/flæt/",
+            partOfSpeech = "noun",
+            translationRu = "квартира",
+            exampleUs = "She rented a bright apartment near the park.",
+            exampleUk = "She rented a bright flat near the park.",
+            exampleRu = "Она сняла светлую квартиру рядом с парком."
+        ),
+        OxfordWordEntity(
+            levelCode = "A0–A1",
+            wordUs = "neighbor",
+            wordUk = "neighbour",
+            ipaUs = "/ˈneɪ.bɚ/",
+            ipaUk = "/ˈneɪ.bə(r)/",
+            partOfSpeech = "noun",
+            translationRu = "сосед, соседка",
+            exampleUs = "Our neighbor helped us carry the boxes.",
+            exampleUk = "Our neighbour helped us carry the boxes.",
+            exampleRu = "Наш сосед помог нам донести коробки."
+        ),
+        OxfordWordEntity(
+            levelCode = "A0–A1",
+            wordUs = "vacation",
+            wordUk = "holiday",
+            ipaUs = "/veɪˈkeɪ.ʃən/",
+            ipaUk = "/ˈhɒl.ə.deɪ/",
+            partOfSpeech = "noun",
+            translationRu = "отпуск, каникулы",
+            exampleUs = "We are going on vacation in August.",
+            exampleUk = "We are going on holiday in August.",
+            exampleRu = "В августе мы едем в отпуск."
+        ),
+        OxfordWordEntity(
+            levelCode = "A0–A1",
+            wordUs = "fall",
+            wordUk = "autumn",
+            ipaUs = "/fɑːl/",
+            ipaUk = "/ˈɔː.təm/",
+            partOfSpeech = "noun",
+            translationRu = "осень",
+            exampleUs = "The leaves turn gold in the fall.",
+            exampleUk = "The leaves turn gold in autumn.",
+            exampleRu = "Осенью листья становятся золотыми."
+        ),
+        OxfordWordEntity(
+            levelCode = "A0–A1",
+            wordUs = "understand",
+            wordUk = "understand",
+            ipaUs = "/ˌʌn.dɚˈstænd/",
+            ipaUk = "/ˌʌn.dəˈstænd/",
+            partOfSpeech = "verb",
+            translationRu = "понимать, осознавать",
+            exampleUs = "Do you understand the main rule?",
+            exampleUk = "Do you understand the main rule?",
+            exampleRu = "Ты понимаешь главное правило?"
+        ),
+
+        // ==================== УРОВЕНЬ A2 (Oxford 3000 Core) ====================
+        OxfordWordEntity(
+            levelCode = "A2",
+            wordUs = "schedule",
+            wordUk = "schedule",
+            ipaUs = "/ˈskedʒ.uːl/",
+            ipaUk = "/ˈʃed.juːl/",
+            partOfSpeech = "noun",
+            translationRu = "расписание, график",
+            exampleUs = "We have a very busy schedule this week.",
+            exampleUk = "We have a very busy schedule this week.",
+            exampleRu = "На этой неделе у нас очень плотное расписание."
+        ),
+        OxfordWordEntity(
+            levelCode = "A2",
+            wordUs = "elevator",
+            wordUk = "lift",
+            ipaUs = "/ˈel.ə.veɪ.t̬ɚ/",
+            ipaUk = "/lɪft/",
+            partOfSpeech = "noun",
+            translationRu = "лифт",
+            exampleUs = "Take the elevator to the fifth floor.",
+            exampleUk = "Take the lift to the fifth floor.",
+            exampleRu = "Поднимитесь на лифте на пятый этаж."
+        ),
+        OxfordWordEntity(
+            levelCode = "A2",
+            wordUs = "center",
+            wordUk = "centre",
+            ipaUs = "/ˈsen.t̬ɚ/",
+            ipaUk = "/ˈsen.tə(r)/",
+            partOfSpeech = "noun",
+            translationRu = "центр",
+            exampleUs = "We met right in the city center.",
+            exampleUk = "We met right in the city centre.",
+            exampleRu = "Мы встретились прямо в центре города."
+        ),
+        OxfordWordEntity(
+            levelCode = "A2",
+            wordUs = "experience",
+            wordUk = "experience",
+            ipaUs = "/ɪkˈspɪr.i.əns/",
+            ipaUk = "/ɪkˈspɪə.ri.əns/",
+            partOfSpeech = "noun",
+            translationRu = "опыт, впечатление",
+            exampleUs = "She has five years of teaching experience.",
+            exampleUk = "She has five years of teaching experience.",
+            exampleRu = "У неё пять лет преподавательского опыта."
+        ),
+        OxfordWordEntity(
+            levelCode = "A2",
+            wordUs = "opportunity",
+            wordUk = "opportunity",
+            ipaUs = "/ˌɑː.pɚˈtuː.nə.t̬i/",
+            ipaUk = "/ˌɒp.əˈtjuː.nə.ti/",
+            partOfSpeech = "noun",
+            translationRu = "возможность, удобный случай",
+            exampleUs = "This course is a great opportunity to practice.",
+            exampleUk = "This course is a great opportunity to practise.",
+            exampleRu = "Этот курс — отличная возможность попрактиковаться."
+        ),
+
+        // ==================== УРОВЕНЬ B1 (Oxford 3000 Core) ====================
+        OxfordWordEntity(
+            levelCode = "B1",
+            wordUs = "analyze",
+            wordUk = "analyse",
+            ipaUs = "/ˈæn.əl.aɪz/",
+            ipaUk = "/ˈæn.əl.aɪz/",
+            partOfSpeech = "verb",
+            translationRu = "анализировать, разбирать",
+            exampleUs = "Let's analyze the results of the experiment.",
+            exampleUk = "Let's analyse the results of the experiment.",
+            exampleRu = "Давайте проанализируем результаты эксперимента."
+        ),
+        OxfordWordEntity(
+            levelCode = "B1",
+            wordUs = "behavior",
+            wordUk = "behaviour",
+            ipaUs = "/bɪˈheɪ.vjɚ/",
+            ipaUk = "/bɪˈheɪ.vjə(r)/",
+            partOfSpeech = "noun",
+            translationRu = "поведение, манера держаться",
+            exampleUs = "His polite behavior impressed everyone.",
+            exampleUk = "His polite behaviour impressed everyone.",
+            exampleRu = "Его вежливое поведение произвело впечатление на всех."
+        ),
+        OxfordWordEntity(
+            levelCode = "B1",
+            wordUs = "determine",
+            wordUk = "determine",
+            ipaUs = "/dɪˈtɝː.mɪn/",
+            ipaUk = "/dɪˈtɜː.mɪn/",
+            partOfSpeech = "verb",
+            translationRu = "определять, устанавливать, решаться",
+            exampleUs = "Your daily habits determine your long-term progress.",
+            exampleUk = "Your daily habits determine your long-term progress.",
+            exampleRu = "Твои ежедневные привычки определяют долгосрочный прогресс."
+        ),
+        OxfordWordEntity(
+            levelCode = "B1",
+            wordUs = "environment",
+            wordUk = "environment",
+            ipaUs = "/ɪnˈvaɪ.rən.mənt/",
+            ipaUk = "/ɪnˈvaɪ.rən.mənt/",
+            partOfSpeech = "noun",
+            translationRu = "окружающая среда, обстановка",
+            exampleUs = "A calm environment helps you focus on reading.",
+            exampleUk = "A calm environment helps you focus on reading.",
+            exampleRu = "Спокойная обстановка помогает сосредоточиться на чтении."
+        ),
+        OxfordWordEntity(
+            levelCode = "B1",
+            wordUs = "recognize",
+            wordUk = "recognise",
+            ipaUs = "/ˈrek.əɡ.naɪz/",
+            ipaUk = "/ˈrek.əɡ.naɪz/",
+            partOfSpeech = "verb",
+            translationRu = "узнавать, признавать",
+            exampleUs = "I can recognize this word in context now.",
+            exampleUk = "I can recognise this word in context now.",
+            exampleRu = "Теперь я могу узнать это слово в контексте."
+        ),
+
+        // ==================== УРОВЕНЬ B2 (Oxford 3000 / 5000) ====================
+        OxfordWordEntity(
+            levelCode = "B2",
+            wordUs = "fulfill",
+            wordUk = "fulfil",
+            ipaUs = "/fʊlˈfɪl/",
+            ipaUk = "/fʊlˈfɪl/",
+            partOfSpeech = "verb",
+            translationRu = "выполнять, осуществлять, реализовывать",
+            exampleUs = "She worked hard to fulfill her promise.",
+            exampleUk = "She worked hard to fulfil her promise.",
+            exampleRu = "Она усердно трудилась, чтобы выполнить своё обещание."
+        ),
+        OxfordWordEntity(
+            levelCode = "B2",
+            wordUs = "inevitable",
+            wordUk = "inevitable",
+            ipaUs = "/ˌɪnˈev.ɪ.t̬ə.bəl/",
+            ipaUk = "/ɪnˈev.ɪ.tə.bəl/",
+            partOfSpeech = "adjective",
+            translationRu = "неизбежный, неминуемый",
+            exampleUs = "Mistakes are an inevitable part of learning a language.",
+            exampleUk = "Mistakes are an inevitable part of learning a language.",
+            exampleRu = "Ошибки — неизбежная часть изучения языка."
+        ),
+        OxfordWordEntity(
+            levelCode = "B2",
+            wordUs = "substantial",
+            wordUk = "substantial",
+            ipaUs = "/səbˈstæn.ʃəl/",
+            ipaUk = "/səbˈstæn.ʃəl/",
+            partOfSpeech = "adjective",
+            translationRu = "существенный, значительный, весомый",
+            exampleUs = "You have made substantial progress in grammar.",
+            exampleUk = "You have made substantial progress in grammar.",
+            exampleRu = "Ты добился существенного прогресса в грамматике."
+        ),
+        OxfordWordEntity(
+            levelCode = "B2",
+            wordUs = "controversy",
+            wordUk = "controversy",
+            ipaUs = "/ˈkɑːn.trə.vɝː.si/",
+            ipaUk = "/ˈkɒn.trə.vɜː.si/",
+            partOfSpeech = "noun",
+            translationRu = "спор, полемика, разногласие",
+            exampleUs = "The new policy caused a lot of controversy.",
+            exampleUk = "The new policy caused a lot of controversy.",
+            exampleRu = "Новая политика вызвала много споров."
+        ),
+
+        // ==================== УРОВЕНЬ C1–C2 (Oxford 5000 Advanced) ====================
+        OxfordWordEntity(
+            levelCode = "C1–C2",
+            wordUs = "ambiguous",
+            wordUk = "ambiguous",
+            ipaUs = "/æmˈbɪɡ.ju.əs/",
+            ipaUk = "/æmˈbɪɡ.ju.əs/",
+            partOfSpeech = "adjective",
+            translationRu = "двусмысленный, неоднозначный",
+            exampleUs = "The contract was worded in an ambiguous way.",
+            exampleUk = "The contract was worded in an ambiguous way.",
+            exampleRu = "Договор был сформулирован неоднозначно."
+        ),
+        OxfordWordEntity(
+            levelCode = "C1–C2",
+            wordUs = "meticulous",
+            wordUk = "meticulous",
+            ipaUs = "/məˈtɪk.jə.ləs/",
+            ipaUk = "/məˈtɪk.jʊ.ləs/",
+            partOfSpeech = "adjective",
+            translationRu = "щепетильный, дотошный, тщательный",
+            exampleUs = "He kept meticulous notes on every Murphy grammar unit.",
+            exampleUk = "He kept meticulous notes on every Murphy grammar unit.",
+            exampleRu = "Он вёл тщательные конспекты по каждому юниту грамматики Мёрфи."
+        ),
+        OxfordWordEntity(
+            levelCode = "C1–C2",
+            wordUs = "ubiquitous",
+            wordUk = "ubiquitous",
+            ipaUs = "/juːˈbɪk.wə.t̬əs/",
+            ipaUk = "/juːˈbɪk.wɪ.təs/",
+            partOfSpeech = "adjective",
+            translationRu = "вездесущий, повсеместный",
+            exampleUs = "English idioms have become ubiquitous in global media.",
+            exampleUk = "English idioms have become ubiquitous in global media.",
+            exampleRu = "Английские идиомы стали повсеместными в мировых медиа."
+        ),
+        OxfordWordEntity(
+            levelCode = "C1–C2",
+            wordUs = "skeptical",
+            wordUk = "sceptical",
+            ipaUs = "/ˈskep.tɪ.kəl/",
+            ipaUk = "/ˈskep.tɪ.kəl/",
+            partOfSpeech = "adjective",
+            translationRu = "скептический, сомневающийся",
+            exampleUs = "Researchers remain skeptical about shortcuts without practice.",
+            exampleUk = "Researchers remain sceptical about shortcuts without practice.",
+            exampleRu = "Исследователи скептически относятся к обходным путям без практики."
+        )
+    )
+}
+
+// ============================================================================
+// 4. VIEWMODEL: ЛОГИКА ANKI SM-2, СВЯЗКА СЛОВАРЯ И УРОВНЕЙ, ТАЙМЕР И МЕДАЛИ
+// ============================================================================
+
+enum class AnkiGrade(val label: String, val subLabel: String) {
+    WRONG("Неверно", "Сброс серии • повторим сегодня"),
+    GOOD("Верно", "+1 к серии • по расписанию"),
+    PERFECT("Идеально", "+1 к закрытию слова (3/3)")
+}
+
+class TrackerViewModel(application: Application) : AndroidViewModel(application) {
+    private val db = AppDatabase.getInstance(application)
+    private val dao = db.trackerDao()
+
+    val wordsFlow: StateFlow<List<OxfordWordEntity>> = dao.observeAllWords()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val unitsFlow: StateFlow<List<MurphyUnitEntity>> = dao.observeAllUnits()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val statsFlow: StateFlow<UserStatsEntity> = dao.observeStats()
+        .map { it ?: UserStatsEntity() }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UserStatsEntity())
+
+    // Встроенный секундомер текущей сессии занятий
+    private val _isTimerRunning = MutableStateFlow(false)
+    val isTimerRunning: StateFlow<Boolean> = _isTimerRunning.asStateFlow()
+
+    private val _sessionSeconds = MutableStateFlow(0)
+    val sessionSeconds: StateFlow<Int> = _sessionSeconds.asStateFlow()
+
+    init {
+        viewModelScope.launch {
+            if (dao.getWordCount() == 0) {
+                dao.insertWords(SeedData.getInitialOxfordWords())
+                dao.insertUnits(SeedData.getInitialMurphyUnits())
+                dao.saveStats(UserStatsEntity())
+            } else {
+                checkAndUpdateDailyStreak()
+            }
+        }
+        // Корутина секундомера
+        viewModelScope.launch {
+            while (true) {
+                delay(1000L)
+                if (_isTimerRunning.value) {
+                    _sessionSeconds.value += 1
+                }
+            }
+        }
+    }
+
+    /**
+     * Вычисление прогресса по каждому уровню (A0–A1, A2, B1, B2, C1–C2).
+     * ЖЕСТКОЕ ПРАВИЛО: Словарь уровня считается закрытым на 100% ТОЛЬКО тогда,
+     * когда каждое слово уровня сдано в Anki идеально (perfectStreak >= 3).
+     */
+    val levelSummariesFlow: StateFlow<List<LevelProgressSummary>> = combine(
+        wordsFlow,
+        unitsFlow
+    ) { allWords, allUnits ->
+        CefrLevel.entries.map { level ->
+            val levelUnits = allUnits.filter { it.levelCode == level.code }
+            val completedUnits = levelUnits.count { it.isCompleted }
+            val grammarPercent = if (levelUnits.isEmpty()) 0 else
+                ((completedUnits.toFloat() / levelUnits.size) * 100f).roundToInt()
+
+            val levelWords = allWords.filter { it.levelCode == level.code }
+            val masteredWords = levelWords.count { it.isMasteredInAnki }
+            val isVocabFullyClosed = levelWords.isNotEmpty() && masteredWords == levelWords.size
+
+            // Процент словаря считается по среднему прогрессу идеальных сдач в Anki,
+            // но 100% дается ТОЛЬКО когда абсолютно все слова уровня закрыты идеально (3/3)!
+            val rawVocabFraction = if (levelWords.isEmpty()) 0f else
+                levelWords.sumOf { it.masteryFraction.toDouble() }.toFloat() / levelWords.size
+            val vocabAnkiPercent = if (isVocabFullyClosed) {
+                100
+            } else {
+                // Не позволяем показать 100%, пока хотя бы одно слово не сдано идеально до конца
+                (rawVocabFraction * 100f).roundToInt().coerceAtMost(99)
+            }
+
+            val isGrammarClosed = levelUnits.isNotEmpty() && completedUnits == levelUnits.size
+            val isLevelFullyClosed = isGrammarClosed && isVocabFullyClosed
+
+            val overallPercent = if (isLevelFullyClosed) {
+                100
+            } else {
+                ((grammarPercent + vocabAnkiPercent) / 2.0).roundToInt().coerceAtMost(99)
+            }
+
+            LevelProgressSummary(
+                level = level,
+                totalUnits = levelUnits.size,
+                completedUnits = completedUnits,
+                grammarPercent = grammarPercent,
+                totalWordsInDb = levelWords.size,
+                masteredWordsInAnki = masteredWords,
+                vocabAnkiPercent = vocabAnkiPercent,
+                overallPercent = overallPercent,
+                isVocabFullyClosed = isVocabFullyClosed,
+                isLevelFullyClosed = isLevelFullyClosed
+            )
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /**
+     * Вычисление медалей и достижений за пройденный путь.
+     */
+    val medalsFlow: StateFlow<List<MedalItem>> = combine(
+        wordsFlow,
+        unitsFlow,
+        statsFlow,
+        levelSummariesFlow
+    ) { words, units, stats, summaries ->
+        val masteredWordsCount = words.count { it.isMasteredInAnki }
+        val completedUnitsCount = units.count { it.isCompleted }
+        val hoursStudied = stats.totalMinutesStudied / 60f
+        val a1Summary = summaries.find { it.level == CefrLevel.A0_A1 }
+        val a2Summary = summaries.find { it.level == CefrLevel.A2 }
+        val b1b2Units = units.filter { it.levelCode == "B1" || it.levelCode == "B2" }
+        val c1c2Summary = summaries.find { it.level == CefrLevel.C1_C2 }
+
+        listOf(
+            MedalItem(
+                id = "MEDAL_FIRST_ANKI",
+                title = "Первая идеальная карточка",
+                description = "Закрыть первое слово из словаря Oxford в Anki со статусом 3/3 «Идеально»",
+                categoryLabel = "Anki & Oxford",
+                isUnlocked = masteredWordsCount >= 1,
+                progressText = "${masteredWordsCount.coerceAtMost(1)} / 1 слово",
+                progressFraction = (masteredWordsCount / 1f).coerceIn(0f, 1f)
+            ),
+            MedalItem(
+                id = "MEDAL_A1_VOCAB_CLOSED",
+                title = "Словарь Oxford A0–A1 закрыт",
+                description = "Сдать абсолютно все слова уровня A0–A1 в Anki идеально (3/3 без ошибок)",
+                categoryLabel = "Уровень A1",
+                isUnlocked = a1Summary?.isVocabFullyClosed == true,
+                progressText = "${a1Summary?.masteredWordsInAnki ?: 0} / ${a1Summary?.totalWordsInDb ?: 0} слов идеально",
+                progressFraction = ((a1Summary?.vocabAnkiPercent ?: 0) / 100f).coerceIn(0f, 1f)
+            ),
+            MedalItem(
+                id = "MEDAL_RED_MURPHY",
+                title = "Покоритель Красного Мёрфи",
+                description = "Пройти все юниты Essential Grammar in Use (уровни A0–A1 и A2)",
+                categoryLabel = "Грамматика Мёрфи",
+                isUnlocked = (a1Summary?.grammarPercent == 100) && (a2Summary?.grammarPercent == 100),
+                progressText = "${(a1Summary?.completedUnits ?: 0) + (a2Summary?.completedUnits ?: 0)} / ${(a1Summary?.totalUnits ?: 0) + (a2Summary?.totalUnits ?: 0)} юнитов",
+                progressFraction = (((a1Summary?.grammarPercent ?: 0) + (a2Summary?.grammarPercent ?: 0)) / 200f).coerceIn(0f, 1f)
+            ),
+            MedalItem(
+                id = "MEDAL_BLUE_MURPHY",
+                title = "Мастер Синего Мёрфи (B1–B2)",
+                description = "Закрыть все юниты классического English Grammar in Use",
+                categoryLabel = "Грамматика Мёрфи",
+                isUnlocked = b1b2Units.isNotEmpty() && b1b2Units.all { it.isCompleted },
+                progressText = "${b1b2Units.count { it.isCompleted }} / ${b1b2Units.size} юнитов",
+                progressFraction = if (b1b2Units.isEmpty()) 0f else b1b2Units.count { it.isCompleted }.toFloat() / b1b2Units.size
+            ),
+            MedalItem(
+                id = "MEDAL_GREEN_MURPHY",
+                title = "Академик C1–C2 (Зелёный Мёрфи)",
+                description = "Полностью закрыть уровень C1–C2: Advanced Grammar и словарь в Anki",
+                categoryLabel = "Высший уровень",
+                isUnlocked = c1c2Summary?.isLevelFullyClosed == true,
+                progressText = "${c1c2Summary?.overallPercent ?: 0}% уровня C1–C2",
+                progressFraction = ((c1c2Summary?.overallPercent ?: 0) / 100f).coerceIn(0f, 1f)
+            ),
+            MedalItem(
+                id = "MEDAL_STREAK_7",
+                title = "Железная дисциплина (7 дней)",
+                description = "Заниматься английским 7 дней подряд без пропусков",
+                categoryLabel = "Стрик",
+                isUnlocked = stats.longestStreakDays >= 7,
+                progressText = "${stats.longestStreakDays.coerceAtMost(7)} / 7 дней подряд",
+                progressFraction = (stats.longestStreakDays / 7f).coerceIn(0f, 1f)
+            ),
+            MedalItem(
+                id = "MEDAL_HOURS_10",
+                title = "Первые 10 часов практики",
+                description = "Набрать 10 чистых часов изучения грамматики и карточек",
+                categoryLabel = "Время",
+                isUnlocked = hoursStudied >= 10f,
+                progressText = String.format(Locale.US, "%.1f / 10.0 ч", hoursStudied.coerceAtMost(10f)),
+                progressFraction = (hoursStudied / 10f).coerceIn(0f, 1f)
+            )
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    fun setDialect(dialect: EnglishDialect) {
+        viewModelScope.launch {
+            val current = dao.getStatsOnce() ?: UserStatsEntity()
+            dao.saveStats(current.copy(selectedDialect = dialect.name))
+        }
+    }
+
+    fun toggleMurphyUnit(unit: MurphyUnitEntity) {
+        viewModelScope.launch {
+            dao.updateUnit(unit.copy(isCompleted = !unit.isCompleted))
+            recordStudyActivity()
+        }
+    }
+
+    /**
+     * Оценка карточки в Anki с обновлением интервала SM-2 и статуса идеальной сдачи.
+     */
+    fun submitAnkiReview(word: OxfordWordEntity, grade: AnkiGrade) {
+        viewModelScope.launch {
+            val today = LocalDate.now().toEpochDay()
+            val updated = when (grade) {
+                AnkiGrade.WRONG -> {
+                    // Ошибка сбрасывает идеальную серию до 0: слово снова открыто и требует повтора
+                    word.copy(
+                        perfectStreak = 0,
+                        intervalDays = 0,
+                        easeFactor = max(1.3f, word.easeFactor - 0.2f),
+                        nextReviewEpochDay = today,
+                        totalReviews = word.totalReviews + 1,
+                        lastResultCorrect = false
+                    )
+                }
+                AnkiGrade.GOOD -> {
+                    val newStreak = (word.perfectStreak + 1).coerceAtMost(OxfordWordEntity.REQUIRED_PERFECT_STREAK)
+                    val nextInterval = when (word.intervalDays) {
+                        0 -> 1
+                        1 -> 3
+                        else -> (word.intervalDays * word.easeFactor).roundToInt()
+                    }
+                    word.copy(
+                        perfectStreak = newStreak,
+                        intervalDays = nextInterval,
+                        nextReviewEpochDay = today + nextInterval,
+                        totalReviews = word.totalReviews + 1,
+                        lastResultCorrect = true
+                    )
+                }
+                AnkiGrade.PERFECT -> {
+                    val newStreak = (word.perfectStreak + 1).coerceAtMost(OxfordWordEntity.REQUIRED_PERFECT_STREAK)
+                    val nextInterval = when (word.intervalDays) {
+                        0 -> 2
+                        1 -> 5
+                        else -> (word.intervalDays * (word.easeFactor + 0.15f)).roundToInt()
+                    }
+                    word.copy(
+                        perfectStreak = newStreak,
+                        intervalDays = nextInterval,
+                        easeFactor = word.easeFactor + 0.1f,
+                        nextReviewEpochDay = today + nextInterval,
+                        totalReviews = word.totalReviews + 1,
+                        lastResultCorrect = true
+                    )
+                }
+            }
+            dao.updateWord(updated)
+
+            val stats = dao.getStatsOnce() ?: UserStatsEntity()
+            dao.saveStats(stats.copy(totalAnkiReviews = stats.totalAnkiReviews + 1))
+            recordStudyActivity()
+        }
+    }
+
+    fun addCustomOxfordWord(
+        levelCode: String,
+        wordUs: String,
+        wordUk: String,
+        ipaUs: String,
+        ipaUk: String,
+        partOfSpeech: String,
+        translationRu: String,
+        exampleEn: String,
+        exampleRu: String
+    ) {
+        viewModelScope.launch {
+            dao.insertWord(
+                OxfordWordEntity(
+                    levelCode = levelCode,
+                    wordUs = wordUs.trim(),
+                    wordUk = wordUk.ifBlank { wordUs }.trim(),
+                    ipaUs = ipaUs.ifBlank { "/${wordUs.trim()}/" },
+                    ipaUk = ipaUk.ifBlank { ipaUs.ifBlank { "/${wordUk.trim()}/" } },
+                    partOfSpeech = partOfSpeech.ifBlank { "word" },
+                    translationRu = translationRu.trim(),
+                    exampleUs = exampleEn.trim(),
+                    exampleUk = exampleEn.trim(),
+                    exampleRu = exampleRu.trim()
+                )
+            )
+        }
+    }
+
+    fun toggleTimer() {
+        _isTimerRunning.value = !_isTimerRunning.value
+    }
+
+    fun finishAndSaveTimerSession() {
+        viewModelScope.launch {
+            _isTimerRunning.value = false
+            val minutesToAdd = max(1, (_sessionSeconds.value / 60.0).roundToInt())
+            _sessionSeconds.value = 0
+            addStudyMinutes(minutesToAdd)
+        }
+    }
+
+    fun addStudyMinutes(minutes: Int) {
+        viewModelScope.launch {
+            val stats = dao.getStatsOnce() ?: UserStatsEntity()
+            dao.saveStats(stats.copy(totalMinutesStudied = stats.totalMinutesStudied + minutes))
+            recordStudyActivity()
+        }
+    }
+
+    private suspend fun checkAndUpdateDailyStreak() {
+        val stats = dao.getStatsOnce() ?: return
+        val today = LocalDate.now().toEpochDay()
+        val diff = today - stats.lastStudyEpochDay
+        if (diff > 1L) {
+            // Пропущен день — стрик сбрасывается до 1 при следующем занятии
+            dao.saveStats(stats.copy(currentStreakDays = 0))
+        }
+    }
+
+    private suspend fun recordStudyActivity() {
+        val stats = dao.getStatsOnce() ?: UserStatsEntity()
+        val today = LocalDate.now().toEpochDay()
+        val diff = today - stats.lastStudyEpochDay
+        val newStreak = when {
+            diff == 0L -> max(1, stats.currentStreakDays)
+            diff == 1L -> stats.currentStreakDays + 1
+            else -> 1
+        }
+        val newLongest = max(stats.longestStreakDays, newStreak)
+        dao.saveStats(
+            stats.copy(
+                currentStreakDays = newStreak,
+                longestStreakDays = newLongest,
+                lastStudyEpochDay = today
+            )
+        )
+    }
+}
+
+// ============================================================================
+// 5. МИНИМАЛИСТИЧНАЯ СВЕТЛАЯ ТЕМА (БЕЗ УСТАЛОСТИ ГЛАЗ • WARM PAPER PALETTE)
+// ============================================================================
+
+object SoftPaperColors {
+    val Background = Color(0xFFFAF8F5)       // Теплый бумажный белый (без резкого синего свечения)
+    val SurfaceCard = Color(0xFFFFFFFF)      // Чистая карточка с мягким теплым контуром
+    val SurfaceSubtle = Color(0xFFF2EFE9)    // Приглушенный песочно-серый для плашек и прогресс-баров
+    val BorderWarm = Color(0xFFE5E0D8)       // Мягкая линия разделителей
+    val SagePrimary = Color(0xFF2E6B59)      // Спокойный шалфейно-изумрудный (основной акцент)
+    val SageLight = Color(0xFFE6F0EC)        // Светлая подложка под активные элементы
+    val SlateAccent = Color(0xFF3B5B7E)      // Приглушенный индиго-сланец (для грамматики и UK/US)
+    val SlateLight = Color(0xFFE9EFF5)
+    val AmberAccent = Color(0xFFB87D2B)      // Мягкое золото для медалей и стриков
+    val AmberLight = Color(0xFFFDF5E6)
+    val CoralSoft = Color(0xFFB84A39)        // Ненавязчивый терракотовый для ошибок в Anki
+    val CoralLight = Color(0xFFFAECE9)
+    val TextPrimary = Color(0xFF22262A)      // Глубокий графит вместо чистого черного (комфорт чтения)
+    val TextSecondary = Color(0xFF5E656B)    // Вторичный текст и транскрипция
+    val TextMuted = Color(0xFF888F96)
+}
+
+private val SoftLightColorScheme = lightColorScheme(
+    primary = SoftPaperColors.SagePrimary,
+    onPrimary = Color.White,
+    primaryContainer = SoftPaperColors.SageLight,
+    onPrimaryContainer = SoftPaperColors.SagePrimary,
+    secondary = SoftPaperColors.SlateAccent,
+    onSecondary = Color.White,
+    secondaryContainer = SoftPaperColors.SlateLight,
+    onSecondaryContainer = SoftPaperColors.SlateAccent,
+    background = SoftPaperColors.Background,
+    onBackground = SoftPaperColors.TextPrimary,
+    surface = SoftPaperColors.SurfaceCard,
+    onSurface = SoftPaperColors.TextPrimary,
+    surfaceVariant = SoftPaperColors.SurfaceSubtle,
+    onSurfaceVariant = SoftPaperColors.TextSecondary,
+    outline = SoftPaperColors.BorderWarm
+)
+
+@Composable
+fun SoftMinimalistTheme(content: @Composable () -> Unit) {
+    // Строго светлая минималистичная тема для комфортного длительного чтения
+    MaterialTheme(
+        colorScheme = SoftLightColorScheme,
+        content = content
+    )
+}
+
+// ============================================================================
+// 6. ЭКРАНЫ ПРИЛОЖЕНИЯ (JETPACK COMPOSE)
+// ============================================================================
+
+enum class NavTab(val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
+    DASHBOARD("Прогресс", Icons.Outlined.Analytics),
+    ANKI("Anki", Icons.Outlined.Style),
+    OXFORD("Словарь", Icons.Outlined.MenuBook),
+    MURPHY("Мёрфи", Icons.Outlined.School),
+    MEDALS("Медали", Icons.Outlined.EmojiEvents)
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            SoftMinimalistTheme {
+                EnglishTrackerRoot()
+            }
+        }
+    }
+}
+
+@Composable
+fun EnglishTrackerRoot(vm: TrackerViewModel = viewModel()) {
+    val stats by vm.statsFlow.collectAsState()
+    val words by vm.wordsFlow.collectAsState()
+    val units by vm.unitsFlow.collectAsState()
+    val summaries by vm.levelSummariesFlow.collectAsState()
+    val medals by vm.medalsFlow.collectAsState()
+    val isTimerRunning by vm.isTimerRunning.collectAsState()
+    val sessionSeconds by vm.sessionSeconds.collectAsState()
+
+    val currentDialect = remember(stats.selectedDialect) {
+        runCatching { EnglishDialect.valueOf(stats.selectedDialect) }.getOrDefault(EnglishDialect.US)
+    }
+
+    var selectedTab by remember { mutableStateOf(NavTab.DASHBOARD) }
+    var selectedLevelFilter by remember { mutableStateOf<CefrLevel?>(null) }
+
+    // Инициализация синтезатора речи (TTS) с поддержкой US и UK произношения
+    val context = LocalContext.current
+    var ttsEngine by remember { mutableStateOf<TextToSpeech?>(null) }
+    DisposableEffect(context) {
+        var instance: TextToSpeech? = null
+        instance = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                instance?.language = Locale.US
+            }
+        }
+        ttsEngine = instance
+        onDispose {
+            instance?.stop()
+            instance?.shutdown()
+        }
+    }
+
+    val speakWord: (String, EnglishDialect) -> Unit = { text, dialect ->
+        ttsEngine?.let { tts ->
+            tts.language = if (dialect == EnglishDialect.US) Locale.US else Locale.UK
+            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "oxford_word_tts")
+        }
+    }
+
+    Scaffold(
+        containerColor = SoftPaperColors.Background,
+        topBar = {
+            MinimalistTopBar(
+                dialect = currentDialect,
+                streakDays = stats.currentStreakDays,
+                onDialectToggle = {
+                    val next = if (currentDialect == EnglishDialect.US) EnglishDialect.UK else EnglishDialect.US
+                    vm.setDialect(next)
+                }
+            )
+        },
+        bottomBar = {
+            NavigationBar(
+                containerColor = SoftPaperColors.SurfaceCard,
+                tonalElevation = 0.dp
+            ) {
+                NavTab.entries.forEach { tab ->
+                    NavigationBarItem(
+                        selected = selectedTab == tab,
+                        onClick = { selectedTab = tab },
+                        icon = { Icon(tab.icon, contentDescription = tab.label) },
+                        label = { Text(tab.label, fontSize = 11.sp, fontWeight = FontWeight.Medium) },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = SoftPaperColors.SagePrimary,
+                            selectedTextColor = SoftPaperColors.SagePrimary,
+                            indicatorColor = SoftPaperColors.SageLight,
+                            unselectedIconColor = SoftPaperColors.TextSecondary,
+                            unselectedTextColor = SoftPaperColors.TextSecondary
+                        )
+                    )
+                }
+            }
+        }
+    ) { innerPadding ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+        ) {
+            when (selectedTab) {
+                NavTab.DASHBOARD -> DashboardScreen(
+                    stats = stats,
+                    summaries = summaries,
+                    isTimerRunning = isTimerRunning,
+                    sessionSeconds = sessionSeconds,
+                    onToggleTimer = vm::toggleTimer,
+                    onFinishTimer = vm::finishAndSaveTimerSession,
+                    onQuickAddMinutes = vm::addStudyMinutes,
+                    onOpenLevelAnki = { level ->
+                        selectedLevelFilter = level
+                        selectedTab = NavTab.ANKI
+                    },
+                    onOpenLevelMurphy = { level ->
+                        selectedLevelFilter = level
+                        selectedTab = NavTab.MURPHY
+                    }
+                )
+                NavTab.ANKI -> AnkiDeckScreen(
+                    words = words,
+                    summaries = summaries,
+                    dialect = currentDialect,
+                    selectedLevel = selectedLevelFilter,
+                    onSelectLevel = { selectedLevelFilter = it },
+                    onGradeWord = vm::submitAnkiReview,
+                    onSpeak = { text -> speakWord(text, currentDialect) }
+                )
+                NavTab.OXFORD -> OxfordDictionaryScreen(
+                    words = words,
+                    summaries = summaries,
+                    dialect = currentDialect,
+                    selectedLevel = selectedLevelFilter,
+                    onSelectLevel = { selectedLevelFilter = it },
+                    onSpeak = { text -> speakWord(text, currentDialect) },
+                    onAddWord = vm::addCustomOxfordWord
+                )
+                NavTab.MURPHY -> MurphyGrammarScreen(
+                    units = units,
+                    summaries = summaries,
+                    selectedLevel = selectedLevelFilter,
+                    onSelectLevel = { selectedLevelFilter = it },
+                    onToggleUnit = vm::toggleMurphyUnit
+                )
+                NavTab.MEDALS -> MedalsScreen(
+                    medals = medals,
+                    stats = stats,
+                    summaries = summaries
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun MinimalistTopBar(
+    dialect: EnglishDialect,
+    streakDays: Int,
+    onDialectToggle: () -> Unit
+) {
+    Surface(
+        color = SoftPaperColors.SurfaceCard,
+        border = BorderStroke(1.dp, SoftPaperColors.BorderWarm)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column {
+                Text(
+                    text = "Murphy & Oxford",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = SoftPaperColors.TextPrimary
+                )
+                Text(
+                    text = "A0–A1 → C1–C2 • Anki-связка",
+                    fontSize = 12.sp,
+                    color = SoftPaperColors.TextSecondary
+                )
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Переключатель US / UK английского
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = SoftPaperColors.SlateLight,
+                    border = BorderStroke(1.dp, SoftPaperColors.SlateAccent.copy(alpha = 0.25f)),
+                    modifier = Modifier.clickable { onDialectToggle() }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(text = dialect.flag, fontSize = 14.sp)
+                        Text(
+                            text = "EN-${dialect.shortLabel}",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = SoftPaperColors.SlateAccent
+                        )
+                        Icon(
+                            imageVector = Icons.Default.SwapHoriz,
+                            contentDescription = "Переключить US/UK",
+                            tint = SoftPaperColors.SlateAccent,
+                            modifier = Modifier.size(15.dp)
+                        )
+                    }
+                }
+
+                // Счетчик стрика
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = SoftPaperColors.AmberLight,
+                    border = BorderStroke(1.dp, SoftPaperColors.AmberAccent.copy(alpha = 0.3f))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.LocalFireDepartment,
+                            contentDescription = "Стрик",
+                            tint = SoftPaperColors.AmberAccent,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "$streakDays дн.",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = SoftPaperColors.AmberAccent
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// ЭКРАН 1: ДАШБОРД (ЧАСЫ, ТАЙМЕР И ПРОЦЕНТНЫЙ ПРОГРЕСС ПО УРОВНЯМ A0-C2)
+// ============================================================================
+
+@Composable
+fun DashboardScreen(
+    stats: UserStatsEntity,
+    summaries: List<LevelProgressSummary>,
+    isTimerRunning: Boolean,
+    sessionSeconds: Int,
+    onToggleTimer: () -> Unit,
+    onFinishTimer: () -> Unit,
+    onQuickAddMinutes: (Int) -> Unit,
+    onOpenLevelAnki: (CefrLevel) -> Unit,
+    onOpenLevelMurphy: (CefrLevel) -> Unit
+) {
+    val totalHours = stats.totalMinutesStudied / 60
+    val remainingMins = stats.totalMinutesStudied % 60
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        // Карточка учета часов и встроенного таймера занятий
+        item {
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = SoftPaperColors.SurfaceCard,
+                border = BorderStroke(1.dp, SoftPaperColors.BorderWarm)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text(
+                                text = "Время занятий и фокус",
+                                fontSize = 14.sp,
+                                color = SoftPaperColors.TextSecondary
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "${totalHours} ч ${remainingMins} мин",
+                                fontSize = 24.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = SoftPaperColors.TextPrimary
+                            )
+                        }
+
+                        // Таймер текущей сессии
+                        val mins = sessionSeconds / 60
+                        val secs = sessionSeconds % 60
+                        val timerText = String.format(Locale.US, "%02d:%02d", mins, secs)
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = onToggleTimer,
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, SoftPaperColors.SagePrimary)
+                            ) {
+                                Icon(
+                                    imageVector = if (isTimerRunning) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(text = timerText, fontWeight = FontWeight.SemiBold)
+                            }
+
+                            if (sessionSeconds > 0) {
+                                Button(
+                                    onClick = onFinishTimer,
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = SoftPaperColors.SagePrimary)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Check,
+                                        contentDescription = "Сохранить время",
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Divider(color = SoftPaperColors.BorderWarm)
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Быстрая запись урока:",
+                            fontSize = 12.sp,
+                            color = SoftPaperColors.TextSecondary
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            listOf(15, 30, 60).forEach { minsToAdd ->
+                                AssistChip(
+                                    onClick = { onQuickAddMinutes(minsToAdd) },
+                                    label = { Text("+${minsToAdd} м", fontSize = 12.sp) }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Пояснение правила связки Словаря и Anki
+        item {
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = SoftPaperColors.SageLight,
+                border = BorderStroke(1.dp, SoftPaperColors.SagePrimary.copy(alpha = 0.25f))
+            ) {
+                Row(
+                    modifier = Modifier.padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Verified,
+                        contentDescription = null,
+                        tint = SoftPaperColors.SagePrimary
+                    )
+                    Text(
+                        text = "Правило закрытия уровня: словарь уровня (например, A0–A1) не закроется на 100%, пока каждое его слово не будет сдано в карточках Anki идеально (3/3 раз подряд без ошибок).",
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp,
+                        color = SoftPaperColors.TextPrimary
+                    )
+                }
+            }
+        }
+
+        item {
+            Text(
+                text = "Прогресс по уровням английского (CEFR)",
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = SoftPaperColors.TextPrimary,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
+
+        // Карточки уровней с процентными прогрессами
+        items(summaries) { summary ->
+            LevelProgressCard(
+                summary = summary,
+                onOpenAnki = { onOpenLevelAnki(summary.level) },
+                onOpenMurphy = { onOpenLevelMurphy(summary.level) }
+            )
+        }
+    }
+}
+
+@Composable
+fun LevelProgressCard(
+    summary: LevelProgressSummary,
+    onOpenAnki: () -> Unit,
+    onOpenMurphy: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = SoftPaperColors.SurfaceCard,
+        border = BorderStroke(
+            width = 1.dp,
+            color = if (summary.isLevelFullyClosed) SoftPaperColors.SagePrimary else SoftPaperColors.BorderWarm
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (summary.isLevelFullyClosed) SoftPaperColors.SagePrimary else SoftPaperColors.SurfaceSubtle
+                    ) {
+                        Text(
+                            text = summary.level.code,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (summary.isLevelFullyClosed) Color.White else SoftPaperColors.TextPrimary,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
+                    }
+                    Column {
+                        Text(
+                            text = summary.level.title,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = SoftPaperColors.TextPrimary
+                        )
+                        Text(
+                            text = summary.level.murphyBook,
+                            fontSize = 12.sp,
+                            color = SoftPaperColors.TextSecondary
+                        )
+                    }
+                }
+
+                // Итоговый процент уровня
+                Text(
+                    text = "${summary.overallPercent}%",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = SoftPaperColors.SagePrimary
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Главная шкала уровня
+            LinearProgressIndicator(
+                progress = { summary.overallPercent / 100f },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(8.dp)
+                    .clip(RoundedCornerShape(4.dp)),
+                color = SoftPaperColors.SagePrimary,
+                trackColor = SoftPaperColors.SurfaceSubtle
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Детализация: 1) Грамматика Мёрфи 2) Словарь Oxford через Anki
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                // Грамматика Мёрфи
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = SoftPaperColors.SurfaceSubtle,
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { onOpenMurphy() }
+                ) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "Мёрфи (Юниты)",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = SoftPaperColors.TextSecondary
+                            )
+                            Text(
+                                text = "${summary.grammarPercent}%",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = SoftPaperColors.SlateAccent
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "${summary.completedUnits} из ${summary.totalUnits} тем",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = SoftPaperColors.TextPrimary
+                        )
+                    }
+                }
+
+                // Словарь Oxford + Anki
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = SoftPaperColors.SurfaceSubtle,
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { onOpenAnki() }
+                ) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "Oxford в Anki",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = SoftPaperColors.TextSecondary
+                            )
+                            Text(
+                                text = "${summary.vocabAnkiPercent}%",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = SoftPaperColors.SagePrimary
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "${summary.masteredWordsInAnki}/${summary.totalWordsInDb} идеально (норма ${summary.level.oxfordTargetQuota})",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = SoftPaperColors.TextPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = if (summary.isVocabFullyClosed) {
+                    "✓ Словарь уровня идеально сдан в Anki и полностью закрыт!"
+                } else {
+                    "🔒 Чтобы закрыть словарь ${summary.level.code} на 100%, сдайте все слова уровня в Anki на «Идеально» (3/3)"
+                },
+                fontSize = 11.sp,
+                color = if (summary.isVocabFullyClosed) SoftPaperColors.SagePrimary else SoftPaperColors.TextSecondary
+            )
+        }
+    }
+}
+
+// ============================================================================
+// ЭКРАН 2: КАРТОЧКИ ANKI (ТРАНСКРИПЦИЯ US/UK + ПЕРЕВОД НА РУССКИЙ ПОСЛЕ ОТВЕТА)
+// ============================================================================
+
+@Composable
+fun AnkiDeckScreen(
+    words: List<OxfordWordEntity>,
+    summaries: List<LevelProgressSummary>,
+    dialect: EnglishDialect,
+    selectedLevel: CefrLevel?,
+    onSelectLevel: (CefrLevel?) -> Unit,
+    onGradeWord: (OxfordWordEntity, AnkiGrade) -> Unit,
+    onSpeak: (String) -> Unit
+) {
+    // Фильтруем карточки по выбранному уровню; в первую очередь показываем слова, которые еще не закрыты идеально (perfectStreak < 3)
+    val deckWords = remember(words, selectedLevel) {
+        val filtered = if (selectedLevel == null) words else words.filter { it.levelCode == selectedLevel.code }
+        filtered.sortedWith(
+            compareBy<OxfordWordEntity> { it.isMasteredInAnki }
+                .thenBy { it.nextReviewEpochDay }
+                .thenBy { it.perfectStreak }
+        )
+    }
+
+    var currentIndex by remember(selectedLevel, deckWords.size) { mutableIntStateOf(0) }
+    // Состояние карточки: null = пользователь еще не ответил; иначе содержит выбранную оценку и открывает перевод на русский
+    var answeredGrade by remember { mutableStateOf<AnkiGrade?>(null) }
+
+    val currentWord = deckWords.getOrNull(currentIndex % max(1, deckWords.size))
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        // Фильтр по уровням CEFR
+        LevelFilterBar(
+            selectedLevel = selectedLevel,
+            onSelectLevel = {
+                onSelectLevel(it)
+                answeredGrade = null
+                currentIndex = 0
+            }
+        )
+
+        if (currentWord == null) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Нет карточек для выбранного уровня", color = SoftPaperColors.TextSecondary)
+            }
+            return@Column
+        }
+
+        // Статус закрытия словаря выбранного уровня
+        val unmasteredCount = deckWords.count { !it.isMasteredInAnki }
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = SoftPaperColors.SurfaceSubtle
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Осталось идеально сдать до закрытия:",
+                    fontSize = 12.sp,
+                    color = SoftPaperColors.TextSecondary
+                )
+                Text(
+                    text = "$unmasteredCount из ${deckWords.size} слов",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = SoftPaperColors.SagePrimary
+                )
+            }
+        }
+
+        // Главная карточка Anki
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = SoftPaperColors.SurfaceCard,
+            border = BorderStroke(1.dp, SoftPaperColors.BorderWarm),
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                // Верхняя строка карточки: уровень, часть речи и серия идеальных ответов (X/3)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = SoftPaperColors.SlateLight
+                    ) {
+                        Text(
+                            text = "${currentWord.levelCode} • ${currentWord.partOfSpeech}",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = SoftPaperColors.SlateAccent,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
+                    }
+
+                    // Индикатор 3 точек идеальной сдачи
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = "До закрытия слова:",
+                            fontSize = 12.sp,
+                            color = SoftPaperColors.TextSecondary
+                        )
+                        repeat(OxfordWordEntity.REQUIRED_PERFECT_STREAK) { dotIndex ->
+                            val active = dotIndex < currentWord.perfectStreak
+                            Box(
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        if (active) SoftPaperColors.SagePrimary
+                                        else SoftPaperColors.BorderWarm
+                                    )
+                            )
+                        }
+                    }
+                }
+
+                // Центральный блок: Слово (US/UK), Транскрипция IPA и Озвучка
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = currentWord.displayWord(dialect),
+                        fontSize = 34.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = SoftPaperColors.TextPrimary,
+                        textAlign = TextAlign.Center
+                    )
+
+                    // Транскрипция выбранного диалекта + показ альтернативного варианта US/UK, если написание отличается
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "${dialect.shortLabel} ${currentWord.displayIpa(dialect)}",
+                            fontSize = 18.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = SoftPaperColors.TextSecondary
+                        )
+                        IconButton(
+                            onClick = { onSpeak(currentWord.displayWord(dialect)) },
+                            modifier = Modifier
+                                .size(34.dp)
+                                .clip(CircleShape)
+                                .background(SoftPaperColors.SageLight)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.VolumeUp,
+                                contentDescription = "Прослушать произношение",
+                                tint = SoftPaperColors.SagePrimary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+
+                    if (currentWord.wordUs != currentWord.wordUk) {
+                        Text(
+                            text = "🇺🇸 ${currentWord.wordUs} (${currentWord.ipaUs})  •  🇬🇧 ${currentWord.wordUk} (${currentWord.ipaUk})",
+                            fontSize = 12.sp,
+                            color = SoftPaperColors.TextMuted,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    // ПОКАЗ ПЕРЕВОДА НА РУССКИЙ И ПРИМЕРА ПОСЛЕ ВЕРНОГО ИЛИ НЕВЕРНОГО ОТВЕТА
+                    AnimatedVisibility(
+                        visible = answeredGrade != null,
+                        enter = fadeIn(),
+                        exit = fadeOut()
+                    ) {
+                        val grade = answeredGrade ?: AnkiGrade.GOOD
+                        val isError = grade == AnkiGrade.WRONG
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = if (isError) SoftPaperColors.CoralLight else SoftPaperColors.SageLight,
+                            border = BorderStroke(
+                                1.dp,
+                                if (isError) SoftPaperColors.CoralSoft.copy(alpha = 0.35f)
+                                else SoftPaperColors.SagePrimary.copy(alpha = 0.35f)
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(16.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = when (grade) {
+                                        AnkiGrade.WRONG -> "Неверно • Серия сброшена (0/3), повторим сегодня"
+                                        AnkiGrade.GOOD -> "Верно! • Прогресс закрытия: ${currentWord.perfectStreak}/3"
+                                        AnkiGrade.PERFECT -> if (currentWord.isMasteredInAnki)
+                                            "Идеально (3/3)! • Слово полностью закрыто в словаре"
+                                        else
+                                            "Идеально! • Прогресс закрытия слова: ${currentWord.perfectStreak}/3"
+                                    },
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (isError) SoftPaperColors.CoralSoft else SoftPaperColors.SagePrimary
+                                )
+
+                                // Перевод на русский
+                                Text(
+                                    text = currentWord.translationRu,
+                                    fontSize = 24.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = SoftPaperColors.TextPrimary,
+                                    textAlign = TextAlign.Center
+                                )
+
+                                Divider(color = SoftPaperColors.BorderWarm)
+
+                                // Пример в контексте + перевод примера
+                                Text(
+                                    text = currentWord.displayExample(dialect),
+                                    fontSize = 14.sp,
+                                    fontStyle = FontStyle.Italic,
+                                    color = SoftPaperColors.TextPrimary,
+                                    textAlign = TextAlign.Center
+                                )
+                                Text(
+                                    text = currentWord.exampleRu,
+                                    fontSize = 13.sp,
+                                    color = SoftPaperColors.TextSecondary,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                        }
+                    }
+
+                    if (answeredGrade == null) {
+                        Text(
+                            text = "Вспомните перевод и произношение слова, затем выберите результат ниже — сразу откроется перевод на русский и пример.",
+                            fontSize = 13.sp,
+                            color = SoftPaperColors.TextMuted,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(horizontal = 12.dp)
+                        )
+                    }
+                }
+
+                // Нижняя панель кнопок ответа
+                if (answeredGrade == null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        // Неверно
+                        OutlinedButton(
+                            onClick = {
+                                onGradeWord(currentWord, AnkiGrade.WRONG)
+                                answeredGrade = AnkiGrade.WRONG
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(14.dp),
+                            border = BorderStroke(1.dp, SoftPaperColors.CoralSoft)
+                        ) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.padding(vertical = 4.dp)
+                            ) {
+                                Text("Неверно", fontWeight = FontWeight.Bold, color = SoftPaperColors.CoralSoft)
+                                Text("Сброс 0/3", fontSize = 10.sp, color = SoftPaperColors.TextSecondary)
+                            }
+                        }
+
+                        // Верно (Хорошо)
+                        OutlinedButton(
+                            onClick = {
+                                onGradeWord(currentWord, AnkiGrade.GOOD)
+                                answeredGrade = AnkiGrade.GOOD
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(14.dp),
+                            border = BorderStroke(1.dp, SoftPaperColors.SlateAccent)
+                        ) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.padding(vertical = 4.dp)
+                            ) {
+                                Text("Верно", fontWeight = FontWeight.Bold, color = SoftPaperColors.SlateAccent)
+                                Text("Помню", fontSize = 10.sp, color = SoftPaperColors.TextSecondary)
+                            }
+                        }
+
+                        // Идеально (закрывает слово)
+                        Button(
+                            onClick = {
+                                onGradeWord(currentWord, AnkiGrade.PERFECT)
+                                answeredGrade = AnkiGrade.PERFECT
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = SoftPaperColors.SagePrimary)
+                        ) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.padding(vertical = 4.dp)
+                            ) {
+                                Text("Идеально", fontWeight = FontWeight.Bold, color = Color.White)
+                                Text("+1 к 3/3", fontSize = 10.sp, color = Color.White.copy(alpha = 0.85f))
+                            }
+                        }
+                    }
+                } else {
+                    Button(
+                        onClick = {
+                            answeredGrade = null
+                            currentIndex = (currentIndex + 1) % max(1, deckWords.size)
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = SoftPaperColors.SagePrimary)
+                    ) {
+                        Text("Следующая карточка →", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// ЭКРАН 3: СЛОВАРЬ OXFORD ПО УРОВНЯМ (С ИНДИКАТОРОМ ЗАКРЫТИЯ В ANKI И US/UK)
+// ============================================================================
+
+@Composable
+fun OxfordDictionaryScreen(
+    words: List<OxfordWordEntity>,
+    summaries: List<LevelProgressSummary>,
+    dialect: EnglishDialect,
+    selectedLevel: CefrLevel?,
+    onSelectLevel: (CefrLevel?) -> Unit,
+    onSpeak: (String) -> Unit,
+    onAddWord: (String, String, String, String, String, String, String, String, String) -> Unit
+) {
+    var showAddDialog by remember { mutableStateOf(false) }
+    val filteredWords = remember(words, selectedLevel) {
+        if (selectedLevel == null) words else words.filter { it.levelCode == selectedLevel.code }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column {
+                Text(
+                    text = "Словарь Oxford 3000 / 5000",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = SoftPaperColors.TextPrimary
+                )
+                Text(
+                    text = "Слово закрывается после 3/3 «Идеально» в Anki",
+                    fontSize = 12.sp,
+                    color = SoftPaperColors.TextSecondary
+                )
+            }
+
+            OutlinedButton(
+                onClick = { showAddDialog = true },
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Слово", fontSize = 12.sp)
+            }
+        }
+
+        LevelFilterBar(selectedLevel = selectedLevel, onSelectLevel = onSelectLevel)
+
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            items(filteredWords, key = { it.id }) { word ->
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = SoftPaperColors.SurfaceCard,
+                    border = BorderStroke(
+                        1.dp,
+                        if (word.isMasteredInAnki) SoftPaperColors.SagePrimary.copy(alpha = 0.5f)
+                        else SoftPaperColors.BorderWarm
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = word.displayWord(dialect),
+                                    fontSize = 17.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = SoftPaperColors.TextPrimary
+                                )
+                                Text(
+                                    text = word.displayIpa(dialect),
+                                    fontSize = 13.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = SoftPaperColors.TextSecondary
+                                )
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = SoftPaperColors.SurfaceSubtle
+                                ) {
+                                    Text(
+                                        text = word.levelCode,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = SoftPaperColors.TextSecondary,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+
+                            if (word.wordUs != word.wordUk) {
+                                Text(
+                                    text = "US: ${word.wordUs} • UK: ${word.wordUk}",
+                                    fontSize = 11.sp,
+                                    color = SoftPaperColors.SlateAccent
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = word.translationRu,
+                                fontSize = 14.sp,
+                                color = SoftPaperColors.TextPrimary
+                            )
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            IconButton(onClick = { onSpeak(word.displayWord(dialect)) }) {
+                                Icon(
+                                    imageVector = Icons.Default.VolumeUp,
+                                    contentDescription = "Озвучить",
+                                    tint = SoftPaperColors.SagePrimary
+                                )
+                            }
+
+                            // Статус идеальной сдачи в Anki
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (word.isMasteredInAnki) SoftPaperColors.SageLight else SoftPaperColors.SurfaceSubtle
+                            ) {
+                                Text(
+                                    text = if (word.isMasteredInAnki) "✓ Закрыто" else "Anki ${word.perfectStreak}/3",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (word.isMasteredInAnki) SoftPaperColors.SagePrimary else SoftPaperColors.TextSecondary,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showAddDialog) {
+        AddOxfordWordDialog(
+            initialLevel = selectedLevel ?: CefrLevel.A0_A1,
+            onDismiss = { showAddDialog = false },
+            onSave = { lvl, us, uk, ipaUs, ipaUk, pos, ru, exEn, exRu ->
+                onAddWord(lvl.code, us, uk, ipaUs, ipaUk, pos, ru, exEn, exRu)
+                showAddDialog = false
+            }
+        )
+    }
+}
+
+@Composable
+fun AddOxfordWordDialog(
+    initialLevel: CefrLevel,
+    onDismiss: () -> Unit,
+    onSave: (CefrLevel, String, String, String, String, String, String, String, String) -> Unit
+) {
+    var level by remember { mutableStateOf(initialLevel) }
+    var wordUs by remember { mutableStateOf("") }
+    var wordUk by remember { mutableStateOf("") }
+    var ipaUs by remember { mutableStateOf("") }
+    var translationRu by remember { mutableStateOf("") }
+    var exampleEn by remember { mutableStateOf("") }
+    var exampleRu by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = SoftPaperColors.SurfaceCard,
+        title = { Text("Добавить слово в базу Oxford", fontSize = 17.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = wordUs,
+                    onValueChange = { wordUs = it },
+                    label = { Text("Слово (US English)") },
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = wordUk,
+                    onValueChange = { wordUk = it },
+                    label = { Text("Британский вариант (UK, если отличается)") },
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = ipaUs,
+                    onValueChange = { ipaUs = it },
+                    label = { Text("Транскрипция (например /ˈwɝːd/)") },
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = translationRu,
+                    onValueChange = { translationRu = it },
+                    label = { Text("Перевод на русский") },
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = exampleEn,
+                    onValueChange = { exampleEn = it },
+                    label = { Text("Пример предложения (EN)") },
+                    singleLine = true
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (wordUs.isNotBlank() && translationRu.isNotBlank()) {
+                        onSave(level, wordUs, wordUk, ipaUs, ipaUs, "word", translationRu, exampleEn, exampleRu)
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = SoftPaperColors.SagePrimary)
+            ) {
+                Text("Добавить")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Отмена")
+            }
+        }
+    )
+}
+
+// ============================================================================
+// ЭКРАН 4: КНИГИ МЁРФИ (A0–A1 ДО C1–C2 • ESSENTIAL, BLUE, ADVANCED GRAMMAR)
+// ============================================================================
+
+@Composable
+fun MurphyGrammarScreen(
+    units: List<MurphyUnitEntity>,
+    summaries: List<LevelProgressSummary>,
+    selectedLevel: CefrLevel?,
+    onSelectLevel: (CefrLevel?) -> Unit,
+    onToggleUnit: (MurphyUnitEntity) -> Unit
+) {
+    val filteredUnits = remember(units, selectedLevel) {
+        if (selectedLevel == null) units else units.filter { it.levelCode == selectedLevel.code }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text(
+            text = "Программа по книгам Raymond Murphy",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold,
+            color = SoftPaperColors.TextPrimary
+        )
+        Text(
+            text = "Red Murphy (A0–A2) • Blue Murphy (B1–B2) • Green Murphy (C1–C2)",
+            fontSize = 12.sp,
+            color = SoftPaperColors.TextSecondary
+        )
+
+        LevelFilterBar(selectedLevel = selectedLevel, onSelectLevel = onSelectLevel)
+
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            items(filteredUnits, key = { it.unitId }) { unit ->
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = SoftPaperColors.SurfaceCard,
+                    border = BorderStroke(
+                        1.dp,
+                        if (unit.isCompleted) SoftPaperColors.SagePrimary.copy(alpha = 0.45f)
+                        else SoftPaperColors.BorderWarm
+                    ),
+                    modifier = Modifier.clickable { onToggleUnit(unit) }
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Checkbox(
+                            checked = unit.isCompleted,
+                            onCheckedChange = { onToggleUnit(unit) },
+                            colors = CheckboxDefaults.colors(
+                                checkedColor = SoftPaperColors.SagePrimary
+                            )
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = SoftPaperColors.SlateLight
+                                ) {
+                                    Text(
+                                        text = unit.levelCode,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = SoftPaperColors.SlateAccent,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                                Text(
+                                    text = unit.bookTitle,
+                                    fontSize = 11.sp,
+                                    color = SoftPaperColors.TextSecondary
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = unit.titleEn,
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = SoftPaperColors.TextPrimary
+                            )
+                            Text(
+                                text = unit.descriptionRu,
+                                fontSize = 13.sp,
+                                color = SoftPaperColors.TextSecondary
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// ЭКРАН 5: МЕДАЛИ И ДОСТИЖЕНИЯ ЗА ПРОЙДЕННЫЙ ПУТЬ
+// ============================================================================
+
+@Composable
+fun MedalsScreen(
+    medals: List<MedalItem>,
+    stats: UserStatsEntity,
+    summaries: List<LevelProgressSummary>
+) {
+    val unlockedCount = medals.count { it.isUnlocked }
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item {
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = SoftPaperColors.SurfaceCard,
+                border = BorderStroke(1.dp, SoftPaperColors.BorderWarm)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            text = "Зал достижений и медалей",
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = SoftPaperColors.TextPrimary
+                        )
+                        Text(
+                            text = "Открыто наград: $unlockedCount из ${medals.size}",
+                            fontSize = 13.sp,
+                            color = SoftPaperColors.TextSecondary
+                        )
+                    }
+                    Surface(
+                        shape = CircleShape,
+                        color = SoftPaperColors.AmberLight
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.EmojiEvents,
+                            contentDescription = null,
+                            tint = SoftPaperColors.AmberAccent,
+                            modifier = Modifier
+                                .padding(12.dp)
+                                .size(28.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        items(medals, key = { it.id }) { medal ->
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = SoftPaperColors.SurfaceCard,
+                border = BorderStroke(
+                    1.dp,
+                    if (medal.isUnlocked) SoftPaperColors.AmberAccent else SoftPaperColors.BorderWarm
+                )
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Surface(
+                            shape = CircleShape,
+                            color = if (medal.isUnlocked) SoftPaperColors.AmberLight else SoftPaperColors.SurfaceSubtle
+                        ) {
+                            Icon(
+                                imageVector = if (medal.isUnlocked) Icons.Default.WorkspacePremium else Icons.Outlined.Lock,
+                                contentDescription = null,
+                                tint = if (medal.isUnlocked) SoftPaperColors.AmberAccent else SoftPaperColors.TextMuted,
+                                modifier = Modifier
+                                    .padding(10.dp)
+                                    .size(24.dp)
+                            )
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = medal.title,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = SoftPaperColors.TextPrimary
+                                )
+                                Text(
+                                    text = medal.categoryLabel,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (medal.isUnlocked) SoftPaperColors.AmberAccent else SoftPaperColors.TextSecondary
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = medal.description,
+                                fontSize = 13.sp,
+                                color = SoftPaperColors.TextSecondary
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        LinearProgressIndicator(
+                            progress = { medal.progressFraction },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(6.dp)
+                                .clip(RoundedCornerShape(3.dp)),
+                            color = if (medal.isUnlocked) SoftPaperColors.AmberAccent else SoftPaperColors.SagePrimary,
+                            trackColor = SoftPaperColors.SurfaceSubtle
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = medal.progressText,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = SoftPaperColors.TextSecondary
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun LevelFilterBar(
+    selectedLevel: CefrLevel?,
+    onSelectLevel: (CefrLevel?) -> Unit
+) {
+    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        item {
+            FilterChip(
+                selected = selectedLevel == null,
+                onClick = { onSelectLevel(null) },
+                label = { Text("Все уровни") }
+            )
+        }
+        items(CefrLevel.entries) { level ->
+            FilterChip(
+                selected = selectedLevel == level,
+                onClick = { onSelectLevel(level) },
+                label = { Text(level.code) }
+            )
+        }
+    }
+}
