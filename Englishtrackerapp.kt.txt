@@ -1,0 +1,1963 @@
+package com.vibe.englishtracker
+
+import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.ClickableText
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.time.LocalDate
+import java.util.Locale
+
+// =====================================================================
+//  Английский трекер v2 — только английский. Один файл.
+//  Собирается существующим workflow (он ищет слово EnglishTrackerRoot).
+// =====================================================================
+
+val LEVELS = listOf("A0", "A1", "A2", "B1", "B2", "C1", "C2")
+val INTERVALS = intArrayOf(1, 3, 7, 14, 30)
+
+val BgC = Color(0xFFF9F7F2)
+val SurfC = Color(0xFFFFFFFF)
+val LineC = Color(0xFFE8E3D9)
+val InkC = Color(0xFF1F2328)
+val MutedC = Color(0xFF6B6F76)
+val GreenC = Color(0xFF2D6B58)
+val GreenSoftC = Color(0xFFE3EFEA)
+val GreenMidC = Color(0xFFC3DDD2)
+val ChipC = Color(0xFFF1EEE7)
+val AmberC = Color(0xFFB8791A)
+val AmberSoftC = Color(0xFFFDF5E4)
+val AmberLineC = Color(0xFFE9D3A0)
+val RedC = Color(0xFFB5412F)
+val RedSoftC = Color(0xFFFBE9E5)
+val BlueC = Color(0xFF2F4F7A)
+val BlueSoftC = Color(0xFFE8EEF6)
+
+// ===================== МОДЕЛИ =====================
+
+data class Word(
+    val key: String, val level: String, val word: String, val pos: String, val ipa: String,
+    val us: String, val tr: List<String>, val example: String, val exampleRu: String, val emoji: String
+)
+
+data class Prog(val s: Int, val due: Long, val mastered: Boolean, val intro: Long, val lapses: Int, val lastWrong: Long)
+data class Quiz(val text: String, val options: List<String>, val answer: Int)
+data class GUnit(
+    val id: String, val level: String, val title: String, val rule: String, val formula: String,
+    val examples: List<String>, val mistake: String, val quiz: List<Quiz>
+)
+data class TextItem(val id: String, val level: String, val title: String, val body: String, val questions: List<Quiz>)
+data class Term(val title: String, val explain: String, val example: String, val wiki: String)
+data class Q(
+    val section: String, val level: String, val text: String, val options: List<String>, val answer: Int,
+    val tip: String, val wordKey: String?, val unitId: String?, val passage: String? = null
+)
+data class TestRec(val day: Long, val kind: String, val level: String, val percent: Int, val passed: Boolean)
+
+class Res(val ok: Boolean, val fixed: String?, val info: String)
+class Medal(val title: String, val desc: String, val done: Boolean, val frac: Float, val label: String)
+class TestResult(
+    val percent: Int, val passed: Boolean, val newLevel: String?,
+    val sections: List<Pair<String, Int>>, val wrong: List<Pair<Q, Int>>
+)
+
+class TestSession(val kind: String, val target: String, val qs: List<Q>, val limitMs: Long) {
+    val startedAt = System.currentTimeMillis()
+    var index by mutableStateOf(0)
+    val answers = mutableStateListOf<Int>().also { l -> repeat(qs.size) { l.add(-1) } }
+    var result by mutableStateOf<TestResult?>(null)
+}
+
+// ===================== КОНТЕНТ =====================
+// Формат словаря (его же принимает кнопка «Загрузить словарь»), разделитель — точка с запятой:
+// id;level;word;pos;ipa;us_word;translations_ru;translations_en;example;example_tr;emoji
+
+private val SEED_CSV = """
+id;level;word;pos;ipa;us_word;translations_ru;translations_en;example;example_tr;emoji
+1;A0;hello;interj;/həˈləʊ/;;привет|здравствуйте;;Hello, my name is Anna.;Здравствуйте, меня зовут Анна.;👋
+2;A0;yes;adv;/jes/;;да;;Yes, I like tea.;Да, я люблю чай.;✅
+3;A0;no;adv;/nəʊ/;;нет;;No, thank you.;Нет, спасибо.;🚫
+4;A0;water;noun;/ˈwɔː.tə/;;вода;;I drink water every day.;Я пью воду каждый день.;💧
+5;A0;house;noun;/haʊs/;;дом;;This is my house.;Это мой дом.;🏠
+6;A0;cat;noun;/kæt/;;кошка|кот;;The cat is on the bed.;Кошка лежит на кровати.;🐱
+7;A0;dog;noun;/dɒɡ/;;собака|пёс;;I have a big dog.;У меня большая собака.;🐶
+8;A0;book;noun;/bʊk/;;книга;;She reads a book.;Она читает книгу.;📖
+9;A0;friend;noun;/frend/;;друг|подруга|приятель;;He is my friend.;Он мой друг.;🤝
+10;A0;morning;noun;/ˈmɔː.nɪŋ/;;утро;;Good morning!;Доброе утро!;🌅
+11;A1;family;noun;/ˈfæm.əl.i/;;семья;;We are a big family.;Мы большая семья.;👪
+12;A1;school;noun;/skuːl/;;школа;;The school is near my house.;Школа рядом с моим домом.;🏫
+13;A1;work;verb;/wɜːk/;;работать|работа;;I work in a shop.;Я работаю в магазине.;💼
+14;A1;buy;verb;/baɪ/;;купить|покупать;;I want to buy bread.;Я хочу купить хлеб.;🛒
+15;A1;eat;verb;/iːt/;;есть|кушать|поесть|покушать;;We eat dinner at seven.;Мы ужинаем в семь.;🍴
+16;A1;big;adj;/bɪɡ/;;большой|крупный;;It is a big city.;Это большой город.;🐘
+17;A1;small;adj;/smɔːl/;;маленький|небольшой;;I have a small bag.;У меня маленькая сумка.;🐭
+18;A1;flat;noun;/flæt/;apartment;квартира;;We live in a small flat.;Мы живём в маленькой квартире.;🏢
+19;A1;colour;noun;/ˈkʌl.ə/;color;цвет|оттенок;;Red is my favourite colour.;Красный — мой любимый цвет.;🎨
+20;A1;neighbour;noun;/ˈneɪ.bə/;neighbor;сосед|соседка;;My neighbour is very kind.;Мой сосед очень добрый.;🏡
+21;A2;understand;verb;/ˌʌn.dəˈstænd/;;понимать|осознавать;;I understand the question.;Я понимаю вопрос.;💡
+22;A2;schedule;noun;/ˈʃed.juːl/;;расписание|график;;Check the train schedule.;Посмотри расписание поездов.;📅
+23;A2;lift;noun;/lɪft/;elevator;лифт;;The lift is broken.;Лифт сломан.;🏬
+24;A2;journey;noun;/ˈdʒɜː.ni/;;поездка|путешествие|путь;;The journey took two hours.;Поездка заняла два часа.;🚆
+25;A2;weather;noun;/ˈweð.ə/;;погода;;The weather is nice today.;Сегодня хорошая погода.;⛅
+26;A2;borrow;verb;/ˈbɒr.əʊ/;;одолжить|занять|взять взаймы|брать взаймы;;Can I borrow your pen?;Можно взять твою ручку?;📝
+27;A2;expensive;adj;/ɪkˈspen.sɪv/;;дорогой|дорогостоящий;;This coat is too expensive.;Это пальто слишком дорогое.;💰
+28;A2;ticket;noun;/ˈtɪk.ɪt/;;билет;;I need a ticket to London.;Мне нужен билет до Лондона.;🎫
+29;A2;decide;verb;/dɪˈsaɪd/;;решить|решать|принять решение;;We decided to stay at home.;Мы решили остаться дома.;🤔
+30;A2;invite;verb;/ɪnˈvaɪt/;;пригласить|приглашать;;I want to invite you to dinner.;Я хочу пригласить тебя на ужин.;💌
+31;B1;experience;noun;/ɪkˈspɪə.ri.əns/;;опыт|впечатление;;She has a lot of work experience.;У неё большой опыт работы.;🎓
+32;B1;opportunity;noun;/ˌɒp.əˈtjuː.nə.ti/;;возможность|шанс|удобный случай;;This job is a great opportunity.;Эта работа — отличная возможность.;🚪
+33;B1;analyse;verb;/ˈæn.əl.aɪz/;analyze;анализировать|разбирать;;We need to analyse the results.;Нам нужно проанализировать результаты.;🔍
+34;B1;environment;noun;/ɪnˈvaɪ.rən.mənt/;;окружающая среда|среда|окружение;;We must protect the environment.;Мы должны беречь окружающую среду.;🌍
+35;B1;improve;verb;/ɪmˈpruːv/;;улучшать|улучшить|совершенствовать;;I want to improve my English.;Я хочу улучшить свой английский.;📈
+36;B1;suggest;verb;/səˈdʒest/;;предлагать|предложить|советовать;;I suggest taking a taxi.;Я предлагаю взять такси.;💬
+37;B1;achieve;verb;/əˈtʃiːv/;;достигать|достичь|добиться;;She achieved her goal.;Она достигла своей цели.;🏆
+38;B1;average;adj;/ˈæv.ər.ɪdʒ/;;средний|среднее;;The average age is thirty.;Средний возраст — тридцать лет.;📊
+39;B1;responsible;adj;/rɪˈspɒn.sə.bəl/;;ответственный;;He is responsible for the project.;Он отвечает за проект.;📋
+40;B1;although;conj;/ɔːlˈðəʊ/;;хотя|несмотря на то что;;Although it was late, we kept working.;Хотя было поздно, мы продолжали работать.;
+41;B2;attitude;noun;/ˈæt.ɪ.tjuːd/;;отношение|позиция|взгляд;;His attitude to work is positive.;У него позитивное отношение к работе.;😊
+42;B2;consequence;noun;/ˈkɒn.sɪ.kwəns/;;последствие|следствие|результат;;Every decision has a consequence.;У каждого решения есть последствия.;
+43;B2;reluctant;adj;/rɪˈlʌk.tənt/;;неохотный|нежелающий;;She was reluctant to speak.;Она неохотно говорила.;
+44;B2;appreciate;verb;/əˈpriː.ʃi.eɪt/;;ценить|быть благодарным|оценить;;I really appreciate your help.;Я очень ценю твою помощь.;🙏
+45;B2;strengthen;verb;/ˈstreŋ.θən/;;укреплять|усиливать|укрепить;;Exercise can strengthen your heart.;Упражнения могут укрепить сердце.;💪
+46;B2;approach;noun;/əˈprəʊtʃ/;;подход|приближаться|подходить;;We need a new approach to the problem.;Нам нужен новый подход к проблеме.;
+47;B2;obstacle;noun;/ˈɒb.stə.kəl/;;препятствие|помеха|преграда;;Fear is the biggest obstacle.;Страх — самое большое препятствие.;🚧
+48;B2;reliable;adj;/rɪˈlaɪ.ə.bəl/;;надёжный;;He is a reliable friend.;Он надёжный друг.;
+49;B2;urban;adj;/ˈɜː.bən/;;городской;;Urban life is very busy.;Городская жизнь очень насыщенная.;🌆
+50;B2;predict;verb;/prɪˈdɪkt/;;предсказывать|прогнозировать|предсказать;;Nobody can predict the future.;Никто не может предсказать будущее.;🔮
+51;C1;ambiguous;adj;/æmˈbɪɡ.ju.əs/;;двусмысленный|неоднозначный;;The answer was deliberately ambiguous.;Ответ был намеренно двусмысленным.;
+52;C1;substantial;adj;/səbˈstæn.ʃəl/;;существенный|значительный|весомый;;They made a substantial profit.;Они получили значительную прибыль.;
+53;C1;mitigate;verb;/ˈmɪt.ɪ.ɡeɪt/;;смягчать|уменьшать|ослаблять;;New laws will mitigate the risk.;Новые законы уменьшат риск.;
+54;C1;scrutiny;noun;/ˈskruː.tɪ.ni/;;тщательное изучение|пристальное внимание|проверка;;The plan came under public scrutiny.;План попал под пристальное внимание общества.;
+55;C1;inevitable;adj;/ɪˈnev.ɪ.tə.bəl/;;неизбежный;;Change is inevitable.;Перемены неизбежны.;
+56;C1;coherent;adj;/kəʊˈhɪə.rənt/;;связный|последовательный|логичный;;She gave a coherent explanation.;Она дала связное объяснение.;
+57;C1;undermine;verb;/ˌʌn.dəˈmaɪn/;;подрывать|ослаблять;;Constant criticism can undermine confidence.;Постоянная критика может подорвать уверенность.;
+58;C1;nuance;noun;/ˈnjuː.ɑːns/;;нюанс|оттенок|тонкость;;He understands every nuance of the language.;Он понимает каждый нюанс языка.;
+59;C1;comprehensive;adj;/ˌkɒm.prɪˈhen.sɪv/;;всесторонний|исчерпывающий|полный;;The report is comprehensive.;Отчёт получился исчерпывающим.;
+60;C1;ubiquitous;adj;/juːˈbɪk.wɪ.təs/;;вездесущий|повсеместный;;Smartphones are ubiquitous today.;Смартфоны сегодня повсеместны.;
+61;C2;ephemeral;adj;/ɪˈfem.ər.əl/;;недолговечный|мимолётный|эфемерный;;Fame can be ephemeral.;Слава бывает недолговечной.;
+62;C2;quintessential;adj;/ˌkwɪn.tɪˈsen.ʃəl/;;типичный|классический|образцовый;;He is the quintessential gentleman.;Он — истинный джентльмен.;
+63;C2;perfunctory;adj;/pəˈfʌŋk.tər.i/;;формальный|поверхностный|небрежный|механический;;She gave a perfunctory nod.;Она кивнула для вида.;
+64;C2;obfuscate;verb;/ˈɒb.fʌ.skeɪt/;;запутывать|затемнять|делать неясным;;Technical jargon can obfuscate the message.;Технический жаргон может затемнять смысл.;
+65;C2;magnanimous;adj;/mæɡˈnæn.ɪ.məs/;;великодушный;;The winner was magnanimous.;Победитель проявил великодушие.;
+66;C2;recalcitrant;adj;/rɪˈkæl.sɪ.trənt/;;непокорный|упрямый|несговорчивый;;The recalcitrant student refused to listen.;Упрямый ученик отказывался слушать.;
+67;C2;serendipity;noun;/ˌser.ənˈdɪp.ɪ.ti/;;счастливая случайность|удачная случайность|везение;;We met by pure serendipity.;Мы встретились по счастливой случайности.;
+68;C2;laconic;adj;/ləˈkɒn.ɪk/;;лаконичный|немногословный|краткий;;His laconic reply ended the debate.;Его лаконичный ответ положил конец спору.;
+69;C2;sycophant;noun;/ˈsɪk.ə.fænt/;;подхалим|льстец;;The king was surrounded by sycophants.;Короля окружали льстецы.;
+70;C2;pernicious;adj;/pəˈnɪʃ.əs/;;пагубный|губительный|вредоносный;;Gossip has a pernicious effect.;Сплетни оказывают пагубное влияние.;
+"""
+
+private val UNITS = listOf(
+    GUnit(
+        "be", "A0", "Глагол to be: am / is / are",
+        "Глагол to be значит «быть». В настоящем времени у него три формы: am, is, are. Какую форму взять, зависит от того, кто действует. После I ставим am, после he, she, it ставим is, после we, you, they ставим are.",
+        "I am • he / she / it is • we / you / they are",
+        listOf("I am a student. — Я студент.", "She is at home. — Она дома.", "They are friends. — Они друзья."),
+        "Нельзя говорить «I is» или «he are». Форма должна подходить тому, кто действует: I am, he is.",
+        listOf(
+            Quiz("She ___ a teacher.", listOf("am", "is", "are", "be"), 1),
+            Quiz("We ___ at school.", listOf("is", "am", "are", "be"), 2),
+            Quiz("I ___ happy today.", listOf("am", "is", "are", "be"), 0),
+            Quiz("They ___ my friends.", listOf("is", "are", "am", "be"), 1),
+            Quiz("It ___ a big house.", listOf("are", "am", "be", "is"), 3)
+        )
+    ),
+    GUnit(
+        "present-simple", "A1", "Present Simple: я работаю, он работает",
+        "Present Simple рассказывает о привычках и фактах. С I, you, we, they глагол не меняется: I work. С he, she, it к глаголу добавляем -s: he works. Для вопроса и отрицания нужны do или does, а после does глагол снова без -s.",
+        "I / you / we / they + глагол • he / she / it + глагол-s",
+        listOf("I drink tea every day. — Я пью чай каждый день.", "She works in a bank. — Она работает в банке.", "Does he like coffee? — Он любит кофе?"),
+        "Часто забывают -s: «he work». И наоборот, ставят -s после does: «does he works». После does глагол без -s.",
+        listOf(
+            Quiz("He ___ football on Sundays.", listOf("play", "plays", "playing", "is play"), 1),
+            Quiz("They ___ in London.", listOf("lives", "live", "living", "is live"), 1),
+            Quiz("___ she like tea?", listOf("Do", "Does", "Is", "Are"), 1),
+            Quiz("I ___ not drink coffee.", listOf("does", "am", "do", "are"), 2),
+            Quiz("Does he ___ English?", listOf("speaks", "speaking", "to speaks", "speak"), 3)
+        )
+    ),
+    GUnit(
+        "past-simple", "A2", "Past Simple: что случилось вчера",
+        "Past Simple рассказывает о том, что уже закончилось в прошлом. У правильных глаголов добавляем -ed: work — worked. У неправильных глаголов форма особая: go — went, see — saw. Для вопроса и отрицания берём did, а глагол остаётся в начальной форме.",
+        "глагол-ed или особая форма • did + глагол (вопрос, отрицание)",
+        listOf("I visited my aunt yesterday. — Вчера я навестил тётю.", "We went to the sea last year. — В прошлом году мы ездили на море.", "Did you see him? — Ты видел его?"),
+        "Нельзя говорить «did you went». После did глагол не меняется: did you go.",
+        listOf(
+            Quiz("Yesterday I ___ to the cinema.", listOf("go", "goed", "went", "gone"), 2),
+            Quiz("She ___ a letter last week.", listOf("writed", "write", "written", "wrote"), 3),
+            Quiz("Did he ___ the door?", listOf("closed", "closes", "close", "closing"), 2),
+            Quiz("We ___ not see the film.", listOf("do", "did", "were", "are"), 1),
+            Quiz("They ___ football yesterday.", listOf("play", "plays", "playing", "played"), 3)
+        )
+    ),
+    GUnit(
+        "present-perfect", "B1", "Present Perfect: have / has + V3",
+        "Present Perfect связывает прошлое с настоящим. Он нужен, когда важен результат сейчас или опыт: I have lost my keys — ключей до сих пор нет. Форма: have или has и третья форма глагола. С he, she, it ставим has.",
+        "have / has + третья форма глагола (V3)",
+        listOf("I have already eaten. — Я уже поел.", "She has never been to Paris. — Она никогда не была в Париже.", "Have you finished? — Ты закончил?"),
+        "Нельзя ставить точное время в прошлом: «I have seen him yesterday». Для yesterday нужен Past Simple: I saw him yesterday.",
+        listOf(
+            Quiz("She ___ never been to Italy.", listOf("have", "has", "is", "did"), 1),
+            Quiz("I have ___ my homework.", listOf("do", "did", "doing", "done"), 3),
+            Quiz("Have you ___ the news?", listOf("hear", "hearing", "heard", "hears"), 2),
+            Quiz("He has lived here ___ 2015.", listOf("for", "since", "from", "during"), 1),
+            Quiz("They ___ just arrived.", listOf("has", "did", "have", "are"), 2)
+        )
+    ),
+    GUnit(
+        "second-conditional", "B2", "Second Conditional: если бы…",
+        "Second Conditional говорит о нереальной или маловероятной ситуации. После if ставим Past Simple, а во второй части — would и глагол без to. Это не рассказ о прошлом: форма Past Simple лишь показывает, что ситуация нереальна. С to be после if часто используют were: If I were you.",
+        "If + Past Simple, would + глагол",
+        listOf("If I had more time, I would travel. — Если бы у меня было больше времени, я бы путешествовал.", "If she were here, she would help us. — Если бы она была здесь, она бы нам помогла.", "What would you do if you won? — Что бы ты сделал, если бы выиграл?"),
+        "Нельзя ставить would после if: «If I would know» — ошибка. Правильно: If I knew.",
+        listOf(
+            Quiz("If I ___ rich, I would buy a boat.", listOf("am", "will be", "would be", "were"), 3),
+            Quiz("If he studied more, he ___ pass.", listOf("will", "can", "would", "did"), 2),
+            Quiz("I would call you if I ___ your number.", listOf("have", "would have", "had", "will have"), 2),
+            Quiz("What ___ you do if you lost your job?", listOf("will", "did", "do", "would"), 3),
+            Quiz("If we ___ more money, we would move.", listOf("have", "would have", "having", "had"), 3)
+        )
+    ),
+    GUnit(
+        "inversion", "C1", "Инверсия после отрицательных слов",
+        "В формальной и письменной речи после слов с отрицательным смыслом порядок слов меняется: сначала вспомогательный глагол, потом подлежащее. Так делают после never, rarely, seldom, hardly, not only. Это усиливает фразу и звучит книжно: вместо I have never seen — Never have I seen.",
+        "Отрицательное слово + вспомогательный глагол + подлежащее + основной глагол",
+        listOf("Never have I seen such a view. — Никогда я не видел такого вида.", "Rarely does he complain. — Он редко жалуется.", "Not only did she win, but she also broke the record. — Она не только победила, но и побила рекорд."),
+        "После Never здесь нельзя оставлять прямой порядок слов: «Never I have seen» — ошибка.",
+        listOf(
+            Quiz("Never ___ such a beautiful place.", listOf("I have seen", "I saw", "have I seen", "did I saw"), 2),
+            Quiz("Rarely ___ late for work.", listOf("is he", "he is", "he was", "does he be"), 0),
+            Quiz("Not only ___ the exam, but she also got the top mark.", listOf("she passed", "did she pass", "she did pass", "passed she"), 1),
+            Quiz("Hardly ___ arrived when it started to rain.", listOf("we had", "did we", "had we", "we have"), 2),
+            Quiz("Seldom ___ such talent.", listOf("do we see", "we see", "we do see", "see we"), 0)
+        )
+    ),
+    GUnit(
+        "mandative", "C2", "Сослагательное после suggest, insist, demand",
+        "После глаголов suggest, insist, demand, recommend и слов essential, vital, important в формальной речи используют начальную форму глагола без -s и без would. Даже с he, she, it окончание -s не нужно: I insist that he leave. Так пишут в договорах, приказах и официальных текстах.",
+        "suggest / insist / demand + that + подлежащее + начальная форма глагола",
+        listOf("I suggest that he apply at once. — Я предлагаю, чтобы он обратился немедленно.", "It is vital that she be present. — Крайне важно, чтобы она присутствовала.", "They demanded that the report be rewritten. — Они потребовали, чтобы отчёт переписали."),
+        "В строгой норме не добавляют -s: «I insist that he leaves» считается менее формальным и неточным.",
+        listOf(
+            Quiz("I insist that he ___ the form today.", listOf("fills", "filled", "will fill", "fill"), 3),
+            Quiz("It is essential that she ___ on time.", listOf("arrives", "arrive", "arrived", "has arrived"), 1),
+            Quiz("The manager demanded that the report ___ finished by Friday.", listOf("is", "was", "be", "being"), 2),
+            Quiz("We recommend that every student ___ the rules.", listOf("reads", "has read", "is reading", "read"), 3),
+            Quiz("It is vital that nobody ___ the room.", listOf("leave", "leaves", "left", "leaving"), 0)
+        )
+    )
+)
+
+private val TEXTS = listOf(
+    TextItem(
+        "t0", "A0", "Tom and his dog",
+        "Hello! My name is Tom. I am ten. I have a dog. The dog is big. I like my dog.",
+        listOf(
+            Quiz("How old is Tom?", listOf("nine", "ten", "eleven"), 1),
+            Quiz("What pet does Tom have?", listOf("a cat", "a bird", "a dog"), 2)
+        )
+    ),
+    TextItem(
+        "t1", "A1", "Saturday at home",
+        "On Saturday I get up at eight. I eat breakfast with my family. Then I help my mother in the kitchen. In the afternoon I watch TV or read a book. In the evening we play games.",
+        listOf(
+            Quiz("When does the speaker get up on Saturday?", listOf("at seven", "at eight", "at nine"), 1),
+            Quiz("Who does the speaker help?", listOf("father", "sister", "mother"), 2)
+        )
+    ),
+    TextItem(
+        "t2", "A2", "A trip to the sea",
+        "Last summer we went to the sea for a week. The weather was hot, so we swam every morning. In the evenings we walked along the beach and ate ice cream. My brother lost his hat in the water, but a kind man found it. It was a wonderful holiday.",
+        listOf(
+            Quiz("How long was the trip?", listOf("a week", "a month", "two days"), 0),
+            Quiz("What happened to the brother's hat?", listOf("it was stolen", "a man found it", "it flew away"), 1)
+        )
+    ),
+    TextItem(
+        "t3", "B1", "Learning online",
+        "More and more people study online because it is flexible and often cheaper than a traditional course. However, many learners say that it is hard to stay motivated without a teacher. Experts suggest setting a regular schedule and finding a study partner. Those who follow this advice usually achieve better results.",
+        listOf(
+            Quiz("Why do many people choose online study?", listOf("It is flexible and often cheaper", "It is easier than school", "It has no exams"), 0),
+            Quiz("What advice do experts give?", listOf("Study only at night", "Set a regular schedule", "Avoid study partners"), 1)
+        )
+    ),
+    TextItem(
+        "t4", "B2", "The urban garden",
+        "In many large cities, empty plots of land are being transformed into community gardens. Residents who once barely spoke to each other now work side by side, growing vegetables and sharing the harvest. Researchers argue that these projects do more than provide fresh food: they strengthen social ties and make neighbourhoods feel safer. Nevertheless, critics point out that the land is often needed for housing.",
+        listOf(
+            Quiz("What do researchers say about the gardens?", listOf("They only produce cheap food", "They strengthen social ties", "They replace housing"), 1),
+            Quiz("What is the critics' concern?", listOf("The gardens are too noisy", "The land may be needed for housing", "Vegetables are expensive"), 1)
+        )
+    ),
+    TextItem(
+        "t5", "C1", "The attention economy",
+        "Digital platforms compete for a scarce resource: human attention. Their design choices, from endless scrolling to unpredictable rewards, are far from neutral; they are calibrated to keep users engaged for as long as possible. While defenders argue that users remain free to log off, a growing body of research suggests that such freedom is more nominal than real, since the mechanisms exploit well-documented cognitive biases.",
+        listOf(
+            Quiz("According to the text, what do platforms compete for?", listOf("money", "attention", "data storage"), 1),
+            Quiz("What do researchers suggest about the freedom to log off?", listOf("It is complete", "It is more apparent than real", "It does not matter"), 1)
+        )
+    ),
+    TextItem(
+        "t6", "C2", "Language and thought",
+        "The conceit that language merely labels pre-existing categories has long been under siege. If vocabulary shapes what its speakers readily notice, then translation is never a transparent exchange of equivalents but a negotiation between divergent ways of carving up experience. Yet the strongest version of this claim, that thought is wholly determined by language, founders on the evidence: speakers routinely grasp distinctions for which they have no single word.",
+        listOf(
+            Quiz("What is the author's attitude to the claim that thought is entirely determined by language?", listOf("enthusiastic", "sceptical", "indifferent"), 1),
+            Quiz("What does the author imply about translation?", listOf("It is simple", "It involves negotiation between different views of experience", "It is impossible"), 1)
+        )
+    )
+)
+
+private val TERMS = listOf(
+    Term("Глагол (verb)", "Слово, которое называет действие или состояние: run, think, be. Отвечает на вопрос «что делать?».", "She reads a book. — Она читает книгу. Здесь reads — глагол.", "Verb"),
+    Term("Существительное (noun)", "Слово, которое называет предмет, человека, место или идею: book, teacher, city. Отвечает на вопрос «кто? что?».", "The dog is big. — Собака большая. Здесь dog — существительное.", "Noun"),
+    Term("Прилагательное (adjective)", "Слово, которое описывает существительное: big, red, happy. Отвечает на вопрос «какой?».", "It is a red car. — Это красная машина. Здесь red — прилагательное.", "Adjective"),
+    Term("Подлежащее (subject)", "Тот, кто выполняет действие в предложении. Обычно стоит перед глаголом.", "Tom plays football. — Том играет в футбол. Подлежащее — Tom.", "Subject_(grammar)"),
+    Term("Артикль (article)", "Маленькое слово перед существительным: a / an («какой-то, один из многих») и the («тот самый, известный»). В русском языке артиклей нет.", "I have a dog. The dog is big. — У меня есть собака. Эта собака большая.", "Article_(grammar)"),
+    Term("Звонкие и глухие согласные", "Звонкие звуки произносим с голосом: b, d, g, v, z. Глухие — без голоса, почти шёпотом: p, t, k, f, s. Положи пальцы на горло: на z оно дрожит, на s — нет.", "bad (звонкий b) и pad (глухой p)", "Voice_(phonetics)"),
+    Term("Гласные звуки (vowels)", "Звуки, при которых воздух идёт свободно, ничто ему не мешает: a, e, i, o, u. Слог строится вокруг гласного звука.", "cat — гласный звук /æ/", "Vowel"),
+    Term("Согласные звуки (consonants)", "Звуки, при которых воздух встречает преграду: губы, зубы или язык. Например: b, t, s, m.", "top — согласные t и p", "Consonant")
+)
+
+// ===================== ПОМОЩНИКИ =====================
+
+fun parseCsv(text: String): List<List<String>> {
+    val rows = ArrayList<List<String>>()
+    var row = ArrayList<String>()
+    val sb = StringBuilder()
+    var q = false
+    val t = text.removePrefix("\uFEFF")
+    var i = 0
+    while (i < t.length) {
+        val c = t[i]
+        if (q) {
+            if (c == '"') {
+                if (i + 1 < t.length && t[i + 1] == '"') {
+                    sb.append('"')
+                    i++
+                } else {
+                    q = false
+                }
+            } else {
+                sb.append(c)
+            }
+        } else if (c == '"') {
+            q = true
+        } else if (c == ';') {
+            row.add(sb.toString())
+            sb.setLength(0)
+        } else if (c == '\n') {
+            row.add(sb.toString())
+            sb.setLength(0)
+            rows.add(row)
+            row = ArrayList()
+        } else if (c != '\r') {
+            sb.append(c)
+        }
+        i++
+    }
+    if (sb.isNotEmpty() || row.isNotEmpty()) {
+        row.add(sb.toString())
+        rows.add(row)
+    }
+    return rows
+}
+
+fun parseWords(text: String): List<Word> {
+    val out = ArrayList<Word>()
+    for (r in parseCsv(text)) {
+        if (r.size < 9) continue
+        val level = r[1].trim().uppercase()
+        val w = r[2].trim()
+        if (w.isEmpty() || level !in LEVELS) continue
+        val tr = r[6].split("|").map { it.trim() }.filter { it.isNotEmpty() }
+        if (tr.isEmpty()) continue
+        out.add(
+            Word(
+                w.lowercase(), level, w, r[3].trim(), r[4].trim(), r[5].trim(), tr,
+                r[8].trim(), r.getOrElse(9) { "" }.trim(), r.getOrElse(10) { "" }.trim()
+            )
+        )
+    }
+    return out
+}
+
+fun norm(s: String): String =
+    s.lowercase().replace('ё', 'е').filter { it.isLetterOrDigit() || it == ' ' }.trim().replace(Regex("\\s+"), " ")
+
+fun lev(a: String, b: String): Int {
+    if (a == b) return 0
+    var prev = IntArray(b.length + 1) { it }
+    for (i in 1..a.length) {
+        val cur = IntArray(b.length + 1)
+        cur[0] = i
+        for (j in 1..b.length) {
+            val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+            cur[j] = minOf(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        }
+        prev = cur
+    }
+    return prev[b.length]
+}
+
+fun wordAt(s: String, off: Int): String? {
+    if (s.isEmpty()) return null
+    var a = off.coerceIn(0, s.length - 1)
+    var b = a
+    if (!(s[a].isLetter() || s[a] == '\'')) return null
+    while (a > 0 && (s[a - 1].isLetter() || s[a - 1] == '\'')) a--
+    while (b < s.length - 1 && (s[b + 1].isLetter() || s[b + 1] == '\'')) b++
+    return s.substring(a, b + 1).lowercase()
+}
+
+fun fmt1(x: Float): String = String.format(Locale.US, "%.1f", x)
+
+fun daysWord(n: Int): String = if (n % 10 == 1 && n % 100 != 11) "день" else "дней"
+
+fun sectionName(sec: String): String = when (sec) {
+    "grammar" -> "Грамматика"
+    "vocab" -> "Лексика"
+    else -> "Чтение"
+}
+
+fun Context.toast(msg: String) {
+    Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+}
+
+// ===================== ЛОГИКА =====================
+
+class AppVm(app: Application) : AndroidViewModel(app) {
+    private val stateFile = File(app.filesDir, "state.json")
+    private val wordsFile = File(app.filesDir, "words.csv")
+    private var baseWords: List<Word> = emptyList()
+
+    var words by mutableStateOf<List<Word>>(emptyList())
+        private set
+    val prog = mutableStateMapOf<String, Prog>()
+    val days = mutableStateMapOf<Long, Int>()
+    val unitPassed = mutableStateMapOf<String, Boolean>()
+    val unitReview = mutableStateMapOf<String, Boolean>()
+    val tests = mutableStateListOf<TestRec>()
+    val custom = mutableStateListOf<Word>()
+    val pinned = mutableStateListOf<String>()
+    var level by mutableStateOf("A0")
+    var startDone by mutableStateOf(false)
+    var limit by mutableStateOf(10)
+    var accent by mutableStateOf("UK")
+    var nextTest by mutableStateOf(0L)
+    var newPaused by mutableStateOf(false)
+    var test by mutableStateOf<TestSession?>(null)
+    private var pending = 0
+    private var lastTouch = System.currentTimeMillis()
+
+    init {
+        val csv = runCatching { if (wordsFile.exists()) wordsFile.readText() else SEED_CSV }.getOrDefault(SEED_CSV)
+        baseWords = parseWords(csv).ifEmpty { parseWords(SEED_CSV) }
+        runCatching { if (stateFile.exists()) load(JSONObject(stateFile.readText())) }
+        rebuild()
+        updatePause()
+    }
+
+    fun today(): Long = LocalDate.now().toEpochDay()
+
+    private fun rebuild() {
+        val m = LinkedHashMap<String, Word>()
+        for (w in baseWords + custom) m.putIfAbsent(w.key, w)
+        words = m.values.sortedBy { LEVELS.indexOf(it.level) }
+    }
+
+    // ---------- сохранение ----------
+
+    private fun toJson(): JSONObject {
+        val o = JSONObject()
+        o.put("level", level)
+        o.put("startDone", startDone)
+        o.put("limit", limit)
+        o.put("accent", accent)
+        o.put("nextTest", nextTest)
+        o.put("newPaused", newPaused)
+        val p = JSONObject()
+        for ((k, v) in prog) {
+            p.put(k, JSONArray(listOf(v.s, v.due, if (v.mastered) 1 else 0, v.intro, v.lapses, v.lastWrong)))
+        }
+        o.put("prog", p)
+        val d = JSONObject()
+        for ((k, v) in days) d.put(k.toString(), v)
+        o.put("days", d)
+        o.put("unitsPassed", JSONArray(unitPassed.filter { it.value }.keys.toList()))
+        o.put("unitsReview", JSONArray(unitReview.filter { it.value }.keys.toList()))
+        o.put("tests", JSONArray(tests.map { JSONArray(listOf(it.day, it.kind, it.level, it.percent, if (it.passed) 1 else 0)) }))
+        o.put("custom", JSONArray(custom.map { JSONArray(listOf(it.word, it.level, it.tr.joinToString("|"), it.example, it.exampleRu)) }))
+        o.put("pinned", JSONArray(pinned.toList()))
+        return o
+    }
+
+    private fun load(o: JSONObject) {
+        level = o.optString("level", "A0").let { if (it in LEVELS) it else "A0" }
+        startDone = o.optBoolean("startDone", false)
+        limit = o.optInt("limit", 10)
+        accent = o.optString("accent", "UK")
+        nextTest = o.optLong("nextTest", 0L)
+        newPaused = o.optBoolean("newPaused", false)
+        prog.clear(); days.clear(); unitPassed.clear(); unitReview.clear()
+        tests.clear(); custom.clear(); pinned.clear()
+        o.optJSONObject("prog")?.let { p ->
+            for (k in p.keys()) {
+                val a = p.getJSONArray(k)
+                prog[k] = Prog(a.getInt(0), a.getLong(1), a.getInt(2) == 1, a.getLong(3), a.getInt(4), a.getLong(5))
+            }
+        }
+        o.optJSONObject("days")?.let { d ->
+            for (k in d.keys()) days[k.toLong()] = d.getInt(k)
+        }
+        o.optJSONArray("unitsPassed")?.let { a ->
+            for (i in 0 until a.length()) unitPassed[a.getString(i)] = true
+        }
+        o.optJSONArray("unitsReview")?.let { a ->
+            for (i in 0 until a.length()) unitReview[a.getString(i)] = true
+        }
+        o.optJSONArray("tests")?.let { a ->
+            for (i in 0 until a.length()) {
+                val r = a.getJSONArray(i)
+                tests.add(TestRec(r.getLong(0), r.getString(1), r.getString(2), r.getInt(3), r.getInt(4) == 1))
+            }
+        }
+        o.optJSONArray("custom")?.let { a ->
+            for (i in 0 until a.length()) {
+                val r = a.getJSONArray(i)
+                val w = r.getString(0)
+                custom.add(Word(w.lowercase(), r.getString(1), w, "", "", "", r.getString(2).split("|"), r.getString(3), r.getString(4), ""))
+            }
+        }
+        o.optJSONArray("pinned")?.let { a ->
+            for (i in 0 until a.length()) pinned.add(a.getString(i))
+        }
+    }
+
+    fun save() {
+        val s = toJson().toString()
+        viewModelScope.launch(Dispatchers.IO) { runCatching { stateFile.writeText(s) } }
+    }
+
+    fun exportJson(): String = toJson().toString(2)
+
+    fun importBackup(text: String): Boolean = try {
+        load(JSONObject(text))
+        rebuild()
+        updatePause()
+        save()
+        true
+    } catch (e: Exception) {
+        false
+    }
+
+    fun importCsv(text: String): Int {
+        val parsed = parseWords(text)
+        if (parsed.isEmpty()) return 0
+        runCatching { wordsFile.writeText(text) }
+        baseWords = parsed
+        rebuild()
+        updatePause()
+        return parsed.size
+    }
+
+    // ---------- время и стрик ----------
+
+    fun touch() {
+        lastTouch = System.currentTimeMillis()
+    }
+
+    fun tick(count: Boolean) {
+        if (!count || System.currentTimeMillis() - lastTouch > 120_000) return
+        pending++
+        if (pending >= 10) flush()
+    }
+
+    fun flush() {
+        if (pending > 0) {
+            val d = today()
+            days[d] = (days[d] ?: 0) + pending
+            pending = 0
+            save()
+        }
+    }
+
+    fun totalSec(): Int = days.values.sum() + pending
+    fun hoursLabel(): String = fmt1(totalSec() / 3600f)
+
+    private fun testDays(): Set<Long> = tests.filter { it.passed }.map { it.day }.toSet()
+    private fun counted(d: Long, td: Set<Long>): Boolean = (days[d] ?: 0) >= 300 || d in td
+
+    fun streak(): Int {
+        val td = testDays()
+        var d = today()
+        if (!counted(d, td)) d--
+        var n = 0
+        while (counted(d, td)) {
+            n++
+            d--
+        }
+        return n
+    }
+
+    fun record(): Int {
+        val td = testDays()
+        val ds = (days.filter { it.value >= 300 }.keys + td).toSortedSet()
+        var best = 0
+        var run = 0
+        var prev = Long.MIN_VALUE
+        for (d in ds) {
+            run = if (d == prev + 1) run + 1 else 1
+            if (run > best) best = run
+            prev = d
+        }
+        return best
+    }
+
+    // ---------- Anki ----------
+
+    fun dueWords(filter: String?): List<Word> {
+        val t = today()
+        return words.filter { w ->
+            (filter == null || w.level == filter) && prog[w.key].let { it != null && !it.mastered && it.due <= t }
+        }.sortedBy { prog[it.key]?.due ?: 0L }
+    }
+
+    fun introducedToday(): Int {
+        val t = today()
+        return prog.values.count { it.intro == t }
+    }
+
+    fun newLeft(): Int = if (newPaused) 0 else maxOf(0, limit - introducedToday())
+
+    private fun nextNew(filter: String?): Word? {
+        for (k in pinned) {
+            val w = words.firstOrNull { it.key == k }
+            if (w != null && prog[k] == null && (filter == null || w.level == filter)) return w
+        }
+        return words.firstOrNull { (filter == null || it.level == filter) && prog[it.key] == null }
+    }
+
+    fun pickCard(filter: String?): Word? {
+        val d = dueWords(filter).firstOrNull()
+        if (d != null) return d
+        return if (newLeft() > 0) nextNew(filter) else null
+    }
+
+    private fun updatePause() {
+        val n = dueWords(null).size
+        if (n > 50) newPaused = true else if (n < 20) newPaused = false
+    }
+
+    private fun checkAnswer(w: Word, input: String): Pair<Boolean, String?> {
+        val x = norm(input)
+        if (x.isEmpty()) return Pair(false, null)
+        var bestD = Int.MAX_VALUE
+        var bestT = ""
+        for (t in w.tr) {
+            val d = lev(x, norm(t))
+            if (d < bestD) {
+                bestD = d
+                bestT = t
+            }
+        }
+        val len = norm(bestT).length
+        val allow = if (len >= 8) 2 else if (len >= 5) 1 else 0
+        return if (bestD == 0) Pair(true, null) else if (bestD <= allow) Pair(true, bestT) else Pair(false, null)
+    }
+
+    private fun applyResult(key: String, ok: Boolean): String {
+        val t = today()
+        val old = prog[key]
+        val intro = old?.intro ?: t
+        val lapses = old?.lapses ?: 0
+        val lastWrong = old?.lastWrong ?: 0L
+        pinned.remove(key)
+        val info: String
+        if (ok) {
+            val s = (old?.s ?: 0) + 1
+            if (s >= 6) {
+                prog[key] = Prog(6, t, true, intro, lapses, lastWrong)
+                info = "Слово закреплено"
+            } else {
+                prog[key] = Prog(s, t + INTERVALS[s - 1], false, intro, lapses, lastWrong)
+                info = "Повторим через ${INTERVALS[s - 1]} дн."
+            }
+        } else {
+            prog[key] = Prog(0, t + 1, false, intro, lapses + 1, t)
+            info = "Повторим завтра"
+        }
+        updatePause()
+        save()
+        return info
+    }
+
+    fun answer(w: Word, input: String?): Res {
+        var ok = false
+        var fixed: String? = null
+        if (input != null) {
+            val c = checkAnswer(w, input)
+            ok = c.first
+            fixed = c.second
+        }
+        val info = applyResult(w.key, ok)
+        return Res(ok, fixed, info)
+    }
+
+    fun pin(key: String) {
+        if (key !in pinned && prog[key] == null) pinned.add(key)
+        save()
+    }
+
+    fun addCustom(word: String, tr: String, example: String): Boolean {
+        val w = word.trim()
+        val t = tr.split("|", ",").map { it.trim() }.filter { it.isNotEmpty() }
+        if (w.isEmpty() || t.isEmpty()) return false
+        custom.add(Word(w.lowercase(), level, w, "", "", "", t, example.trim(), "", ""))
+        rebuild()
+        pin(w.lowercase())
+        return true
+    }
+
+    // ---------- грамматика ----------
+
+    fun finishUnit(id: String, ok: Boolean) {
+        if (ok) {
+            unitPassed[id] = true
+            unitReview.remove(id)
+        } else {
+            unitReview[id] = true
+        }
+        save()
+    }
+
+    // ---------- тесты ----------
+
+    private fun grammarQs(l: String): List<Q> =
+        UNITS.filter { it.level == l }.flatMap { u ->
+            u.quiz.map { q -> Q("grammar", l, q.text, q.options, q.answer, "Правило: ${u.formula}", null, u.id) }
+        }
+
+    private fun readingQs(l: String): List<Q> =
+        TEXTS.filter { it.level == l }.flatMap { t ->
+            t.questions.map { q -> Q("reading", l, q.text, q.options, q.answer, "Ответ есть в тексте «${t.title}»", null, null, t.body) }
+        }
+
+    private fun vocabQs(l: String, n: Int): List<Q> {
+        if (n <= 0) return emptyList()
+        val out = ArrayList<Q>()
+        for (w in words.filter { it.level == l }.shuffled().take(n)) {
+            val right = w.tr.first()
+            val near = words.filter { it.level == l && it.key != w.key }.map { it.tr.first() }
+                .distinct().filter { it != right }.shuffled()
+            val far = words.filter { it.key != w.key }.map { it.tr.first() }
+                .distinct().filter { it != right && it !in near }.shuffled()
+            val wrong = (near + far).take(3)
+            if (wrong.size < 3) continue
+            val opts = (wrong + right).shuffled()
+            out.add(
+                Q("vocab", l, "Что значит слово «${w.word}»?", opts, opts.indexOf(right),
+                    "${w.word} — ${w.tr.joinToString(", ")}", w.key, null)
+            )
+        }
+        return out
+    }
+
+    fun startStartTest() {
+        val qs = ArrayList<Q>()
+        for (l in LEVELS.drop(1)) {
+            val g = grammarQs(l).shuffled().take(3)
+            qs.addAll(g)
+            qs.addAll(vocabQs(l, 5 - g.size))
+        }
+        if (qs.isNotEmpty()) test = TestSession("start", "A1", qs, 0L)
+    }
+
+    fun weeklyTarget(): String = LEVELS.getOrElse(LEVELS.indexOf(level) + 1) { "C2" }
+    fun weeklyAvailable(): Boolean = startDone && today() >= nextTest
+
+    fun startWeekly() {
+        val l = weeklyTarget()
+        val qs = grammarQs(l).shuffled().take(20) + vocabQs(l, 25) + readingQs(l)
+        if (qs.isNotEmpty()) test = TestSession("weekly", l, qs, 40L * 60L * 1000L)
+    }
+
+    fun nextQ() {
+        val s = test ?: return
+        if (s.result != null) return
+        val cur = s.qs[s.index]
+        if (s.index + 1 >= s.qs.size) {
+            finishTest()
+            return
+        }
+        if (s.kind == "start" && s.qs[s.index + 1].level != cur.level) {
+            var a = s.index
+            while (a > 0 && s.qs[a - 1].level == cur.level) a--
+            var right = 0
+            for (k in a..s.index) if (s.answers[k] == s.qs[k].answer) right++
+            if (right * 5 < (s.index - a + 1) * 4) {
+                finishTest()
+                return
+            }
+        }
+        s.index += 1
+    }
+
+    fun finishTest() {
+        val s = test ?: return
+        if (s.result != null) return
+        val last = if (s.kind == "start") s.index else s.qs.lastIndex
+        val wrong = ArrayList<Pair<Q, Int>>()
+        val secTotal = HashMap<String, Int>()
+        val secRight = HashMap<String, Int>()
+        var right = 0
+        for (k in 0..last) {
+            val q = s.qs[k]
+            secTotal[q.section] = (secTotal[q.section] ?: 0) + 1
+            if (s.answers[k] == q.answer) {
+                right++
+                secRight[q.section] = (secRight[q.section] ?: 0) + 1
+            } else {
+                wrong.add(Pair(q, s.answers[k]))
+            }
+        }
+        val count = last + 1
+        val percent = if (count <= 0) 0 else right * 100 / count
+        val secs = listOf("grammar", "vocab", "reading").filter { secTotal.containsKey(it) }
+            .map { sec -> Pair(sec, (secRight[sec] ?: 0) * 100 / (secTotal[sec] ?: 1)) }
+        val passed: Boolean
+        var newLevel: String? = null
+        val t = today()
+        if (s.kind == "start") {
+            var best = "A0"
+            for (l in LEVELS.drop(1)) {
+                val ks = (0..last).filter { s.qs[it].level == l }
+                if (ks.isEmpty()) break
+                val r = ks.count { s.answers[it] == s.qs[it].answer }
+                if (r * 5 >= ks.size * 4) best = l else break
+            }
+            level = best
+            startDone = true
+            passed = true
+            newLevel = best
+        } else {
+            passed = percent >= 75 && secs.all { it.second >= 60 }
+            if (passed) {
+                level = s.target
+                newLevel = s.target
+            }
+        }
+        nextTest = t + 7
+        tests.add(TestRec(t, s.kind, s.target, percent, passed))
+        for (pair in wrong) {
+            val q = pair.first
+            val wk = q.wordKey
+            if (wk != null) applyResult(wk, false)
+            val uid = q.unitId
+            if (uid != null) unitReview[uid] = true
+        }
+        s.result = TestResult(percent, passed, newLevel, secs, wrong)
+        updatePause()
+        save()
+    }
+
+    // ---------- прогресс и медали ----------
+
+    fun levelProgress(l: String): Float {
+        val ws = words.filter { it.level == l }
+        val us = UNITS.filter { it.level == l }
+        val parts = ArrayList<Float>()
+        if (ws.isNotEmpty()) parts.add(ws.count { prog[it.key]?.mastered == true }.toFloat() / ws.size)
+        if (us.isNotEmpty()) parts.add(us.count { unitPassed[it.id] == true }.toFloat() / us.size)
+        return if (parts.isEmpty()) 0f else parts.sum() / parts.size
+    }
+
+    fun nextLevel(): String = LEVELS.getOrElse(LEVELS.indexOf(level) + 1) { "C2" }
+
+    fun nextProgressLabel(): String = "К ${nextLevel()}: ${(levelProgress(nextLevel()) * 100).toInt()}%"
+
+    fun nextTestLabel(): String = if (!startDone) "стартовый" else LocalDate.ofEpochDay(nextTest).toString()
+
+    fun weakItems(): List<String> {
+        val us = UNITS.filter { unitReview[it.id] == true }.map { it.title }
+        val ws = prog.filter { it.value.lapses > 0 && !it.value.mastered && it.value.s <= 1 }
+            .entries.sortedByDescending { it.value.lastWrong }.map { it.key }
+        return (us + ws).take(10)
+    }
+
+    fun streakMedals(): List<Medal> {
+        val r = record()
+        return listOf(7, 14, 21, 28, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360).map { n ->
+            Medal("$n ${daysWord(n)} подряд", "Занимайся $n ${daysWord(n)} без пропусков", r >= n,
+                r.toFloat() / n, "${minOf(r, n)} / $n дн.")
+        }
+    }
+
+    fun timeMedals(): List<Medal> {
+        val h = totalSec() / 3600f
+        return listOf(1, 10, 20, 50, 100, 200, 500, 1000).map { n ->
+            Medal(if (n == 1) "Новичок: 1 час" else "$n часов практики", "Набери $n ч занятий в приложении",
+                h >= n, h / n, "${fmt1(minOf(h, n.toFloat()))} / $n ч")
+        }
+    }
+
+    fun levelMedals(): List<Medal> = LEVELS.drop(1).map { l ->
+        val done = LEVELS.indexOf(level) >= LEVELS.indexOf(l)
+        Medal("Уровень $l", "Пройди тест на уровень $l", done, if (done) 1f else 0f, if (done) "Получено" else "Не получено")
+    }
+}
+
+// ===================== АКТИВНОСТЬ =====================
+
+class MainActivity : ComponentActivity() {
+    private var resumedState by mutableStateOf(false)
+    private lateinit var vm: AppVm
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        vm = ViewModelProvider(this)[AppVm::class.java]
+        setContent {
+            MaterialTheme(colorScheme = lightColorScheme(primary = GreenC, background = BgC, surface = SurfC)) {
+                EnglishTrackerRoot(vm, resumedState)
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumedState = true
+    }
+
+    override fun onPause() {
+        super.onPause()
+        resumedState = false
+        vm.flush()
+    }
+}
+
+// ===================== UI: ОБЩЕЕ =====================
+
+@Composable
+fun H(text: String, size: Int = 18, color: Color = InkC) {
+    Text(text, fontSize = size.sp, fontWeight = FontWeight.Bold, color = color)
+}
+
+@Composable
+fun Sub(text: String, color: Color = MutedC, size: Int = 14) {
+    Text(text, fontSize = size.sp, color = color, lineHeight = (size + 7).sp)
+}
+
+@Composable
+fun Gap(h: Int) {
+    Spacer(Modifier.height(h.dp))
+}
+
+@Composable
+fun AppCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+    Column(
+        modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(SurfC)
+            .border(1.dp, LineC, RoundedCornerShape(22.dp)).padding(18.dp),
+        content = content
+    )
+}
+
+@Composable
+fun Pill(text: String, selected: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier.clip(RoundedCornerShape(50)).background(if (selected) GreenC else ChipC)
+            .clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 9.dp)
+    ) {
+        Text(text, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = if (selected) Color.White else InkC)
+    }
+}
+
+@Composable
+fun Bar(frac: Float, color: Color = GreenC) {
+    Box(Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)).background(ChipC)) {
+        Box(Modifier.fillMaxWidth(frac.coerceIn(0f, 1f)).fillMaxHeight().background(color))
+    }
+}
+
+@Composable
+fun Tile(label: String, value: String, modifier: Modifier = Modifier) {
+    Column(modifier.clip(RoundedCornerShape(16.dp)).background(ChipC).padding(12.dp)) {
+        Text(label, fontSize = 12.sp, color = MutedC)
+        Gap(4)
+        Text(value, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = InkC)
+    }
+}
+
+@Composable
+fun Primary(text: String, modifier: Modifier = Modifier, enabled: Boolean = true, onClick: () -> Unit) {
+    Button(
+        onClick = onClick, enabled = enabled, modifier = modifier, shape = RoundedCornerShape(16.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = GreenC, contentColor = Color.White),
+        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 14.dp)
+    ) { Text(text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold) }
+}
+
+@Composable
+fun Secondary(text: String, modifier: Modifier = Modifier, color: Color = InkC, onClick: () -> Unit) {
+    OutlinedButton(
+        onClick = onClick, modifier = modifier, shape = RoundedCornerShape(16.dp),
+        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 14.dp)
+    ) { Text(text, fontSize = 16.sp, color = color) }
+}
+
+@Composable
+fun OptionRow(text: String, bg: Color, selected: Boolean, enabled: Boolean = true, onClick: () -> Unit) {
+    Box(
+        Modifier.padding(top = 8.dp).fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(bg)
+            .border(1.dp, if (selected) GreenC else Color.Transparent, RoundedCornerShape(14.dp))
+            .clickable(enabled = enabled, onClick = onClick).padding(14.dp)
+    ) { Text(text, fontSize = 16.sp, color = InkC) }
+}
+
+@Composable
+fun LevelFilter(sel: String?, onSel: (String?) -> Unit) {
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Pill("Все уровни", sel == null) { onSel(null) }
+        LEVELS.forEach { l -> Pill(l, sel == l) { onSel(l) } }
+    }
+}
+
+@Composable
+fun StreakChip(n: Int) {
+    Row(
+        Modifier.clip(RoundedCornerShape(50)).background(AmberSoftC)
+            .border(1.dp, AmberLineC, RoundedCornerShape(50)).padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(Icons.Filled.LocalFireDepartment, contentDescription = null, tint = AmberC, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(4.dp))
+        Text("$n дн.", color = AmberC, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+    }
+}
+
+@Composable
+fun AppTopBar(vm: AppVm) {
+    Row(
+        Modifier.fillMaxWidth().background(SurfC).padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text("English", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = InkC)
+            Text("Уровень ${vm.level}", fontSize = 14.sp, color = MutedC)
+        }
+        StreakChip(vm.streak())
+    }
+    Box(Modifier.fillMaxWidth().height(1.dp).background(LineC))
+}
+
+val TABS: List<Pair<String, ImageVector>> = listOf(
+    Pair("Прогресс", Icons.Filled.BarChart),
+    Pair("Anki", Icons.Filled.Style),
+    Pair("Словарь", Icons.Filled.Book),
+    Pair("Грамматика", Icons.Filled.School),
+    Pair("Профиль", Icons.Filled.Person)
+)
+
+@Composable
+fun BottomBar(tab: Int, onSel: (Int) -> Unit) {
+    NavigationBar(containerColor = SurfC) {
+        TABS.forEachIndexed { i, t ->
+            NavigationBarItem(
+                selected = tab == i,
+                onClick = { onSel(i) },
+                icon = { Icon(t.second, contentDescription = null) },
+                label = { Text(t.first, fontSize = 11.sp, maxLines = 1) },
+                colors = NavigationBarItemDefaults.colors(
+                    selectedIconColor = GreenC, selectedTextColor = GreenC, indicatorColor = GreenSoftC,
+                    unselectedIconColor = MutedC, unselectedTextColor = MutedC
+                )
+            )
+        }
+    }
+}
+
+// ===================== UI: КОРЕНЬ =====================
+
+@Composable
+fun EnglishTrackerRoot(vm: AppVm, resumed: Boolean) {
+    val ctx = LocalContext.current
+    var tab by rememberSaveable { mutableStateOf(0) }
+    val tts = remember { TextToSpeech(ctx, null) }
+    DisposableEffect(Unit) { onDispose { tts.shutdown() } }
+    val speak: (String, Boolean) -> Unit = { text, us ->
+        tts.setLanguage(if (us) Locale.US else Locale.UK)
+        tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "w")
+        vm.touch()
+    }
+    // Время считается само: пока приложение открыто, на экране, и были касания в последние 2 минуты.
+    LaunchedEffect(resumed, tab) {
+        while (resumed) {
+            delay(1000)
+            vm.tick(tab != 4)
+        }
+    }
+    BackHandler(enabled = vm.test != null) { vm.test = null }
+    Column(
+        Modifier.fillMaxSize().background(BgC).pointerInput(Unit) {
+            awaitPointerEventScope {
+                while (true) {
+                    awaitPointerEvent(PointerEventPass.Initial)
+                    vm.touch()
+                }
+            }
+        }
+    ) {
+        AppTopBar(vm)
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            val s = vm.test
+            if (s != null) {
+                TestBody(vm, s)
+            } else {
+                when (tab) {
+                    0 -> ProgressScreen(vm)
+                    1 -> AnkiScreen(vm, speak)
+                    2 -> DictScreen(vm, speak)
+                    3 -> GrammarScreen(vm)
+                    else -> ProfileScreen(vm)
+                }
+            }
+        }
+        if (vm.test == null) BottomBar(tab) { tab = it }
+    }
+}
+
+// ===================== UI: ПРОГРЕСС =====================
+
+@Composable
+fun ProgressScreen(vm: AppVm) {
+    LazyColumn(
+        Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item { TodayCard(vm) }
+        item { TestCard(vm) }
+        item { H("Прогресс по уровням", 20) }
+        items(LEVELS) { l -> LevelCard(vm, l) }
+    }
+}
+
+@Composable
+fun TodayCard(vm: AppVm) {
+    val due = vm.dueWords(null).size
+    AppCard {
+        H("Сегодня")
+        Gap(10)
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Tile("Повторы", "$due", Modifier.weight(1f))
+            Tile("Новые слова", "${vm.introducedToday()} из ${vm.limit}", Modifier.weight(1f))
+            Tile("Стрик", "${vm.streak()} дн.", Modifier.weight(1f))
+        }
+    }
+}
+
+@Composable
+fun TestCard(vm: AppVm) {
+    AppCard {
+        if (!vm.startDone) {
+            H("Стартовый тест")
+            Gap(6)
+            Sub("Определит твой уровень. Вопросы идут от A1 и заканчиваются на первом непройденном уровне.")
+            Gap(12)
+            Primary("Начать") { vm.startStartTest() }
+        } else {
+            H("Тест недели")
+            Gap(6)
+            if (vm.weeklyAvailable()) {
+                Sub("Доступен. Проверяет уровень ${vm.weeklyTarget()}, до 40 минут, порог 75%.")
+                Gap(12)
+                Primary("Начать тест") { vm.startWeekly() }
+            } else {
+                Sub("Следующий тест: ${vm.nextTestLabel()}")
+            }
+        }
+    }
+}
+
+@Composable
+fun LevelCard(vm: AppVm, l: String) {
+    val ws = vm.words.filter { it.level == l }
+    val m = ws.count { vm.prog[it.key]?.mastered == true }
+    val us = UNITS.filter { it.level == l }
+    val up = us.count { vm.unitPassed[it.id] == true }
+    val p = vm.levelProgress(l)
+    val cur = l == vm.level
+    AppCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.clip(RoundedCornerShape(12.dp)).background(if (cur) GreenSoftC else ChipC).padding(horizontal = 14.dp, vertical = 8.dp)) {
+                Text(l, fontWeight = FontWeight.Bold, fontSize = 18.sp, color = if (cur) GreenC else InkC)
+            }
+            Spacer(Modifier.weight(1f))
+            Text("${(p * 100).toInt()}%", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = GreenC)
+        }
+        Gap(12)
+        Bar(p)
+        Gap(12)
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Tile("Слова", "$m из ${ws.size}", Modifier.weight(1f))
+            Tile("Грамматика", "$up из ${us.size}", Modifier.weight(1f))
+        }
+    }
+}
+
+// ===================== UI: ANKI =====================
+
+@Composable
+fun AnkiScreen(vm: AppVm, speak: (String, Boolean) -> Unit) {
+    var filter by remember { mutableStateOf<String?>(null) }
+    var card by remember { mutableStateOf(vm.pickCard(null)) }
+    var input by remember { mutableStateOf("") }
+    var res by remember { mutableStateOf<Res?>(null) }
+    LaunchedEffect(filter) {
+        card = vm.pickCard(filter)
+        res = null
+        input = ""
+    }
+    val due = vm.dueWords(filter).size
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        LevelFilter(filter) { filter = it }
+        Sub("Повторы: $due  •  Новых сегодня осталось: ${vm.newLeft()}")
+        val w = card
+        if (w == null) {
+            AppCard {
+                H("На сегодня всё")
+                Gap(6)
+                Sub("Повторять пока нечего, а лимит новых слов исчерпан. Загляни завтра или измени лимит в профиле.")
+            }
+        } else {
+            AppCard {
+                Text(
+                    if (w.pos.isNotBlank()) "${w.level} • ${w.pos}" else w.level,
+                    fontSize = 13.sp, color = BlueC,
+                    modifier = Modifier.clip(RoundedCornerShape(12.dp)).background(BlueSoftC).padding(horizontal = 12.dp, vertical = 6.dp)
+                )
+                if (w.emoji.isNotBlank()) {
+                    Gap(8)
+                    Text(w.emoji, fontSize = 56.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
+                }
+                Gap(8)
+                Text(
+                    w.word, fontSize = 38.sp, fontWeight = FontWeight.Bold, color = InkC,
+                    textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
+                )
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                    if (w.ipa.isNotBlank()) Text("UK ${w.ipa}", fontSize = 18.sp, color = MutedC)
+                    IconButton(onClick = {
+                        val us = vm.accent == "US"
+                        speak(if (us && w.us.isNotBlank()) w.us else w.word, us)
+                    }) { Icon(Icons.Filled.VolumeUp, contentDescription = null, tint = GreenC) }
+                }
+                if (w.us.isNotBlank()) {
+                    Text(
+                        "US: ${w.us}  •  UK: ${w.word}", fontSize = 14.sp, color = BlueC,
+                        textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                Gap(14)
+                val r = res
+                if (r == null) {
+                    OutlinedTextField(
+                        value = input, onValueChange = { input = it; vm.touch() }, singleLine = true,
+                        label = { Text("Перевод на русский") }, modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                        keyboardActions = KeyboardActions(onDone = { if (input.isNotBlank()) res = vm.answer(w, input) })
+                    )
+                    Gap(12)
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Secondary("Не помню", Modifier.weight(1f), RedC) { res = vm.answer(w, null) }
+                        Primary("Проверить", Modifier.weight(1f), input.isNotBlank()) { res = vm.answer(w, input) }
+                    }
+                } else {
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
+                            .background(if (r.ok) GreenSoftC else RedSoftC).padding(14.dp)
+                    ) {
+                        val title = if (r.ok) {
+                            if (r.fixed != null) "Верно (проверь написание: ${r.fixed})" else "Верно"
+                        } else "Неверно"
+                        Text(title, fontSize = 18.sp, fontWeight = FontWeight.Bold, color = if (r.ok) GreenC else RedC)
+                        Gap(6)
+                        Text("Перевод: ${w.tr.joinToString(", ")}", fontSize = 16.sp, color = InkC)
+                        if (w.example.isNotBlank()) {
+                            Gap(8)
+                            Text(w.example, fontSize = 15.sp, color = InkC)
+                            if (w.exampleRu.isNotBlank()) Text(w.exampleRu, fontSize = 14.sp, color = MutedC)
+                        }
+                        Gap(8)
+                        Text(r.info, fontSize = 13.sp, color = MutedC)
+                    }
+                    Gap(12)
+                    Primary("Далее", Modifier.fillMaxWidth()) {
+                        card = vm.pickCard(filter)
+                        res = null
+                        input = ""
+                    }
+                }
+            }
+        }
+        Gap(8)
+    }
+}
+
+// ===================== UI: СЛОВАРЬ =====================
+
+@Composable
+fun DictScreen(vm: AppVm, speak: (String, Boolean) -> Unit) {
+    val ctx = LocalContext.current
+    var q by remember { mutableStateOf("") }
+    var filter by remember { mutableStateOf<String?>(null) }
+    var showAdd by remember { mutableStateOf(false) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri != null) {
+            val text = runCatching {
+                ctx.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+            }.getOrNull()
+            val n = if (text == null) 0 else vm.importCsv(text)
+            ctx.toast(if (n > 0) "Загружено слов: $n" else "Не удалось прочитать словарь")
+        }
+    }
+    val list = remember(vm.words, q, filter) {
+        val s = q.trim().lowercase()
+        vm.words.filter { w ->
+            (filter == null || w.level == filter) &&
+                (s.isEmpty() || w.key.contains(s) || w.tr.any { t -> t.lowercase().contains(s) })
+        }
+    }
+    LazyColumn(
+        Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Словарь", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = InkC)
+                    Sub("Слов: ${vm.words.size}  •  A0–C2")
+                }
+                IconButton(onClick = { showAdd = true }) {
+                    Icon(Icons.Filled.Add, contentDescription = "Добавить слово", tint = GreenC)
+                }
+            }
+        }
+        item {
+            Column {
+                Secondary("Загрузить словарь (CSV)", Modifier.fillMaxWidth()) { picker.launch(arrayOf("*/*")) }
+                Gap(6)
+                Sub("Колонки через «;»: id; level; word; pos; ipa; us_word; translations_ru; translations_en; example; example_tr; emoji. Варианты перевода — через «|».", size = 12)
+            }
+        }
+        item {
+            OutlinedTextField(
+                value = q, onValueChange = { q = it }, singleLine = true, label = { Text("Поиск") },
+                modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)
+            )
+        }
+        item { LevelFilter(filter) { filter = it } }
+        items(list, key = { it.key }) { w -> WordRow(vm, w, speak) }
+    }
+    if (showAdd) AddWordDialog(vm, "") { showAdd = false }
+}
+
+@Composable
+fun WordRow(vm: AppVm, w: Word, speak: (String, Boolean) -> Unit) {
+    val p = vm.prog[w.key]
+    val st = when {
+        p == null -> "Новое"
+        p.mastered -> "Закреплено"
+        else -> "В повторении"
+    }
+    AppCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(w.word, fontSize = 22.sp, fontWeight = FontWeight.Bold, color = InkC)
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        w.level, fontSize = 12.sp, color = MutedC,
+                        modifier = Modifier.clip(RoundedCornerShape(8.dp)).background(ChipC).padding(horizontal = 8.dp, vertical = 3.dp)
+                    )
+                }
+                if (w.ipa.isNotBlank()) Sub(w.ipa)
+                Text(w.tr.joinToString(", "), fontSize = 16.sp, color = InkC)
+            }
+            Column(horizontalAlignment = Alignment.End) {
+                IconButton(onClick = {
+                    val us = vm.accent == "US"
+                    speak(if (us && w.us.isNotBlank()) w.us else w.word, us)
+                }) { Icon(Icons.Filled.VolumeUp, contentDescription = null, tint = GreenC) }
+                Text(st, fontSize = 12.sp, color = MutedC)
+            }
+        }
+    }
+}
+
+@Composable
+fun AddWordDialog(vm: AppVm, preset: String, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    var w by remember { mutableStateOf(preset) }
+    var tr by remember { mutableStateOf("") }
+    var ex by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Новое слово") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(w, { w = it }, label = { Text("Слово (English)") }, singleLine = true)
+                OutlinedTextField(tr, { tr = it }, label = { Text("Перевод (через запятую)") }, singleLine = true)
+                OutlinedTextField(ex, { ex = it }, label = { Text("Пример (необязательно)") })
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                if (vm.addCustom(w, tr, ex)) {
+                    ctx.toast("Слово добавлено в Anki")
+                    onClose()
+                }
+            }) { Text("Добавить") }
+        },
+        dismissButton = { TextButton(onClick = onClose) { Text("Отмена") } }
+    )
+}
+
+// ===================== UI: ГРАММАТИКА =====================
+
+@Composable
+fun GrammarScreen(vm: AppVm) {
+    var mode by remember { mutableStateOf(0) }
+    var unit by remember { mutableStateOf<GUnit?>(null) }
+    var text by remember { mutableStateOf<TextItem?>(null) }
+    var lvl by remember { mutableStateOf<String?>(null) }
+    val u = unit
+    val tx = text
+    if (u != null) {
+        UnitScreen(vm, u) { unit = null }
+    } else if (tx != null) {
+        TextScreen(vm, tx) { text = null }
+    } else {
+        val ctx = LocalContext.current
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Pill("Правила", mode == 0) { mode = 0 }
+                Pill("Тексты", mode == 1) { mode = 1 }
+                Pill("Термины", mode == 2) { mode = 2 }
+            }
+            if (mode == 0) {
+                LevelFilter(lvl) { lvl = it }
+                UNITS.filter { lvl == null || it.level == lvl }.forEach { uu -> UnitRow(vm, uu) { unit = uu } }
+            } else if (mode == 1) {
+                Sub("Читай и нажимай на незнакомые слова: приложение покажет перевод.")
+                TEXTS.forEach { t ->
+                    Row(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(SurfC)
+                            .border(1.dp, LineC, RoundedCornerShape(22.dp)).clickable { text = t }.padding(18.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(t.title, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = InkC)
+                            Sub(t.level, size = 13)
+                        }
+                    }
+                }
+            } else {
+                Sub("Короткие объяснения терминов. Подробнее — в Википедии.")
+                TERMS.forEach { t ->
+                    AppCard {
+                        H(t.title, 17)
+                        Gap(6)
+                        Text(t.explain, fontSize = 15.sp, color = InkC, lineHeight = 22.sp)
+                        Gap(6)
+                        Sub(t.example, size = 13)
+                        Gap(8)
+                        Secondary("Открыть в Википедии", Modifier.fillMaxWidth()) {
+                            runCatching {
+                                ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://en.wikipedia.org/wiki/" + t.wiki)))
+                            }
+                        }
+                    }
+                }
+            }
+            Gap(8)
+        }
+    }
+}
+
+@Composable
+fun UnitRow(vm: AppVm, u: GUnit, onOpen: () -> Unit) {
+    val status = when {
+        vm.unitReview[u.id] == true -> "Повторить"
+        vm.unitPassed[u.id] == true -> "Пройден"
+        else -> "Не начат"
+    }
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(SurfC)
+            .border(1.dp, LineC, RoundedCornerShape(22.dp)).clickable(onClick = onOpen).padding(18.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(u.title, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = InkC)
+            Text("${u.level} • $status", fontSize = 13.sp, color = if (status == "Повторить") AmberC else MutedC)
+        }
+    }
+}
+
+@Composable
+fun UnitScreen(vm: AppVm, u: GUnit, onBack: () -> Unit) {
+    val picks = remember(u.id) { mutableStateListOf<Int>().also { l -> repeat(u.quiz.size) { l.add(-1) } } }
+    var checked by remember(u.id) { mutableStateOf(false) }
+    BackHandler(onBack = onBack)
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        TextButton(onClick = onBack) { Text("← Назад", color = GreenC) }
+        Text(u.title, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = InkC)
+        AppCard {
+            H("Правило")
+            Gap(6)
+            Text(u.rule, fontSize = 16.sp, color = InkC, lineHeight = 24.sp)
+        }
+        AppCard {
+            H("Схема")
+            Gap(8)
+            Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(GreenSoftC).padding(14.dp)) {
+                Text(u.formula, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = GreenC)
+            }
+        }
+        AppCard {
+            H("Примеры")
+            Gap(6)
+            u.examples.forEach { ex ->
+                Text(ex, fontSize = 15.sp, color = InkC, lineHeight = 22.sp)
+                Gap(6)
+            }
+        }
+        AppCard {
+            H("Частая ошибка", 18, RedC)
+            Gap(6)
+            Text(u.mistake, fontSize = 15.sp, color = InkC, lineHeight = 22.sp)
+        }
+        H("Мини-тест", 20)
+        u.quiz.forEachIndexed { qi, q ->
+            AppCard {
+                Text("${qi + 1}. ${q.text}", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = InkC)
+                q.options.forEachIndexed { oi, o ->
+                    val sel = picks[qi] == oi
+                    val bg = when {
+                        !checked -> if (sel) GreenSoftC else ChipC
+                        oi == q.answer -> GreenSoftC
+                        sel -> RedSoftC
+                        else -> ChipC
+                    }
+                    OptionRow(o, bg, sel && !checked, !checked) { picks[qi] = oi }
+                }
+            }
+        }
+        val score = u.quiz.indices.count { picks[it] == u.quiz[it].answer }
+        if (!checked) {
+            Primary("Проверить", Modifier.fillMaxWidth(), picks.all { it >= 0 }) {
+                checked = true
+                vm.finishUnit(u.id, score >= 4)
+            }
+        } else {
+            AppCard {
+                H("Результат: $score из ${u.quiz.size}")
+                Gap(4)
+                Sub(if (score >= 4) "Юнит пройден." else "Нужно минимум 4. Перечитай правило и попробуй ещё раз.")
+            }
+            Secondary("Пройти ещё раз", Modifier.fillMaxWidth()) {
+                for (i in picks.indices) picks[i] = -1
+                checked = false
+            }
+        }
+        Gap(16)
+    }
+}
+
+@Composable
+fun TextScreen(vm: AppVm, t: TextItem, onBack: () -> Unit) {
+    var tapped by remember { mutableStateOf<String?>(null) }
+    BackHandler(onBack = onBack)
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        TextButton(onClick = onBack) { Text("← Назад", color = GreenC) }
+        Text(t.title, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = InkC)
+        Sub(t.level)
+        AppCard {
+            ClickableText(
+                text = AnnotatedString(t.body),
+                style = TextStyle(fontSize = 19.sp, lineHeight = 30.sp, color = InkC),
+                onClick = { off ->
+                    vm.touch()
+                    tapped = wordAt(t.body, off)
+                }
+            )
+        }
+        Sub("Нажми на слово, чтобы увидеть перевод.", size = 13)
+    }
+    val w = tapped
+    if (w != null) WordDialog(vm, w) { tapped = null }
+}
+
+@Composable
+fun WordDialog(vm: AppVm, w: String, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    val cands = listOf(w, w.removeSuffix("s"), w.removeSuffix("es"), w.removeSuffix("ed"), w.removeSuffix("d"), w.removeSuffix("ing"))
+    val found = cands.firstNotNullOfOrNull { c -> vm.words.firstOrNull { it.key == c } }
+    var tr by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text(w) },
+        text = {
+            if (found != null) {
+                Column {
+                    Text(found.tr.joinToString(", "), fontSize = 18.sp, color = InkC)
+                    if (found.ipa.isNotBlank()) Sub(found.ipa)
+                }
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Этого слова нет в словаре.", fontSize = 15.sp, color = MutedC)
+                    OutlinedTextField(tr, { tr = it }, label = { Text("Твой перевод") }, singleLine = true)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                if (found != null) {
+                    vm.pin(found.key)
+                    ctx.toast("Слово добавлено в Anki")
+                    onClose()
+                } else if (vm.addCustom(w, tr, "")) {
+                    ctx.toast("Слово добавлено в Anki")
+                    onClose()
+                }
+            }) { Text(if (found != null) "В Anki" else "Добавить") }
+        },
+        dismissButton = { TextButton(onClick = onClose) { Text("Закрыть") } }
+    )
+}
+
+// ===================== UI: ТЕСТЫ =====================
+
+@Composable
+fun TestBody(vm: AppVm, s: TestSession) {
+    var now by remember(s) { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(s) {
+        while (s.result == null) {
+            delay(1000)
+            now = System.currentTimeMillis()
+            if (s.limitMs > 0 && now - s.startedAt >= s.limitMs) vm.finishTest()
+        }
+    }
+    val r = s.result
+    if (r != null) {
+        ResultView(vm, s, r)
+    } else {
+        val q = s.qs[s.index]
+        val left: Long = if (s.limitMs > 0) maxOf(0L, s.limitMs - (now - s.startedAt)) / 1000 else -1L
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (s.kind == "start") "Стартовый тест" else "Тест недели • ${s.target}",
+                    fontSize = 18.sp, fontWeight = FontWeight.Bold, color = InkC, modifier = Modifier.weight(1f)
+                )
+                if (left >= 0) {
+                    Text(
+                        "%02d:%02d".format(left / 60, left % 60), fontSize = 20.sp, fontWeight = FontWeight.Bold,
+                        color = if (left < 300) RedC else GreenC
+                    )
+                }
+            }
+            Sub("Вопрос ${s.index + 1} из ${s.qs.size}  •  ${sectionName(q.section)}")
+            Bar((s.index + 1).toFloat() / s.qs.size)
+            val ps = q.passage
+            if (ps != null) {
+                AppCard { Text(ps, fontSize = 16.sp, color = InkC, lineHeight = 24.sp) }
+            }
+            AppCard {
+                Text(q.text, fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = InkC)
+                q.options.forEachIndexed { i, o ->
+                    val sel = s.answers[s.index] == i
+                    OptionRow(o, if (sel) GreenSoftC else ChipC, sel) {
+                        vm.touch()
+                        s.answers[s.index] = i
+                    }
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Secondary("Прервать", Modifier.weight(1f)) { vm.test = null }
+                Primary(
+                    if (s.index + 1 >= s.qs.size) "Завершить" else "Далее", Modifier.weight(1f),
+                    s.answers[s.index] >= 0
+                ) { vm.nextQ() }
+            }
+            Gap(16)
+        }
+    }
+}
+
+@Composable
+fun ResultView(vm: AppVm, s: TestSession, r: TestResult) {
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        AppCard {
+            val title = if (r.passed) {
+                if (s.kind == "start") "Уровень определён" else "Тест пройден"
+            } else "Тест не пройден"
+            H(title, 22, if (r.passed) GreenC else RedC)
+            Text("${r.percent}%", fontSize = 48.sp, fontWeight = FontWeight.Bold, color = InkC)
+            r.sections.forEach { sec -> Sub("${sectionName(sec.first)}: ${sec.second}%", size = 15) }
+            if (r.newLevel != null) {
+                Gap(8)
+                H("Твой уровень: ${r.newLevel}", 18, GreenC)
+            }
+            if (s.kind == "weekly" && !r.passed) {
+                Gap(8)
+                Sub("Нужно 75% в целом и 60% в каждом разделе. Следующая попытка через неделю.")
+            }
+        }
+        if (r.wrong.isNotEmpty()) {
+            H("Разбор ошибок", 20)
+            r.wrong.forEach { pair ->
+                val q = pair.first
+                val a = pair.second
+                AppCard {
+                    Text(q.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = InkC)
+                    Gap(6)
+                    Text("Твой ответ: ${if (a >= 0) q.options[a] else "—"}", fontSize = 15.sp, color = RedC)
+                    Text("Верно: ${q.options[q.answer]}", fontSize = 15.sp, color = GreenC)
+                    Gap(4)
+                    Sub(q.tip, size = 13)
+                }
+            }
+        }
+        Primary("Готово", Modifier.fillMaxWidth()) { vm.test = null }
+        Gap(16)
+    }
+}
+
+// ===================== UI: ПРОФИЛЬ =====================
+
+@Composable
+fun ActivityGrid(vm: AppVm) {
+    val t = vm.today()
+    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        for (r in 0 until 4) {
+            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                for (c in 0 until 7) {
+                    val d = t - (27 - (r * 7 + c))
+                    val sec = vm.days[d] ?: 0
+                    val min = if (sec <= 0) 0 else maxOf(1, (sec + 30) / 60)
+                    val bg = if (sec <= 0) ChipC else if (sec >= 300) GreenMidC else GreenSoftC
+                    Box(
+                        Modifier.weight(1f).height(28.dp).clip(RoundedCornerShape(8.dp)).background(bg),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (min > 0) Text("${min}м", fontSize = 12.sp, color = GreenC)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MedalCard(m: Medal) {
+    AppCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier.size(48.dp).clip(CircleShape).background(if (m.done) AmberSoftC else ChipC),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    if (m.done) Icons.Filled.EmojiEvents else Icons.Filled.Lock, contentDescription = null,
+                    tint = if (m.done) AmberC else MutedC
+                )
+            }
+            Spacer(Modifier.width(14.dp))
+            Column(Modifier.weight(1f)) {
+                Text(m.title, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = if (m.done) InkC else MutedC)
+                Sub(m.desc, size = 13)
+                Gap(8)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.weight(1f)) { Bar(m.frac, if (m.done) AmberC else GreenC) }
+                    Spacer(Modifier.width(8.dp))
+                    Text(m.label, fontSize = 12.sp, color = MutedC)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ProfileScreen(vm: AppVm) {
+    val ctx = LocalContext.current
+    var mt by remember { mutableStateOf(0) }
+    LaunchedEffect(Unit) { vm.flush() }
+    val exp = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri: Uri? ->
+        if (uri != null) {
+            vm.flush()
+            val ok = runCatching {
+                ctx.contentResolver.openOutputStream(uri)?.use { it.write(vm.exportJson().toByteArray()) }
+            }.isSuccess
+            ctx.toast(if (ok) "Резервная копия сохранена" else "Не удалось сохранить файл")
+        }
+    }
+    val imp = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri != null) {
+            val text = runCatching {
+                ctx.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            }.getOrNull()
+            ctx.toast(if (text != null && vm.importBackup(text)) "Прогресс восстановлен" else "Не удалось прочитать копию")
+        }
+    }
+    val medals = when (mt) {
+        0 -> vm.streakMedals()
+        1 -> vm.timeMedals()
+        else -> vm.levelMedals()
+    }
+    val weak = vm.weakItems()
+    LazyColumn(
+        Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item {
+            AppCard {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("English", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = InkC, modifier = Modifier.weight(1f))
+                    Box(Modifier.clip(RoundedCornerShape(14.dp)).background(GreenSoftC).padding(horizontal = 14.dp, vertical = 8.dp)) {
+                        Text("Уровень ${vm.level}", color = GreenC, fontWeight = FontWeight.Bold)
+                    }
+                }
+                Gap(10)
+                Sub("Часы: ${vm.hoursLabel()} ч • След. тест: ${vm.nextTestLabel()} • ${vm.nextProgressLabel()}", size = 15)
+            }
+        }
+        item {
+            AppCard {
+                H("Слабые темы и слова (до 10)", 20)
+                Gap(8)
+                if (weak.isEmpty()) {
+                    Sub("Пока нет ошибок.", size = 15)
+                } else {
+                    weak.forEach { x ->
+                        Text(x, fontSize = 16.sp, color = RedC, lineHeight = 24.sp)
+                        Gap(4)
+                    }
+                }
+            }
+        }
+        item {
+            AppCard {
+                H("Статистика и календарь активности", 20)
+                Gap(12)
+                Sub("Всего времени: ${vm.hoursLabel()} ч • Стрик: ${vm.streak()} дн. (рекорд: ${vm.record()} дн.)", size = 16)
+                Gap(16)
+                ActivityGrid(vm)
+            }
+        }
+        item { H("Достижения и медали", 22) }
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Pill("Стрик", mt == 0) { mt = 0 }
+                Pill("Время", mt == 1) { mt = 1 }
+                Pill("Уровни", mt == 2) { mt = 2 }
+            }
+        }
+        items(medals) { m -> MedalCard(m) }
+        item {
+            AppCard {
+                H("Настройки")
+                Gap(10)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Новых слов в день", fontSize = 16.sp, color = InkC, modifier = Modifier.weight(1f))
+                    OutlinedButton(
+                        onClick = { vm.limit = (vm.limit - 1).coerceAtLeast(0); vm.save() },
+                        contentPadding = PaddingValues(0.dp), modifier = Modifier.size(40.dp)
+                    ) { Text("−", fontSize = 18.sp) }
+                    Text("${vm.limit}", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = InkC, modifier = Modifier.padding(horizontal = 14.dp))
+                    OutlinedButton(
+                        onClick = { vm.limit = (vm.limit + 1).coerceAtMost(30); vm.save() },
+                        contentPadding = PaddingValues(0.dp), modifier = Modifier.size(40.dp)
+                    ) { Text("+", fontSize = 18.sp) }
+                }
+                Gap(12)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Озвучка", fontSize = 16.sp, color = InkC, modifier = Modifier.weight(1f))
+                    Pill("UK", vm.accent == "UK") { vm.accent = "UK"; vm.save() }
+                    Spacer(Modifier.width(8.dp))
+                    Pill("US", vm.accent == "US") { vm.accent = "US"; vm.save() }
+                }
+                Gap(12)
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Secondary("Экспорт", Modifier.weight(1f)) { exp.launch("backup-${LocalDate.now()}.json") }
+                    Secondary("Импорт", Modifier.weight(1f)) { imp.launch(arrayOf("*/*")) }
+                }
+            }
+        }
+        item { Gap(8) }
+    }
+}
