@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,7 +22,7 @@ jobs:
             echo "Error: Could not find file containing EnglishTrackerRoot!"
             exit 1
           fi
-          echo "Using source file: $MATCH_FILE"
+          echo "Using source file: $MATCH_FILE ($(wc -l < "$MATCH_FILE") lines)"
           cp "$MATCH_FILE" /tmp/MainActivity.kt
 
           rm -rf app/src/main/java app/src/main/kotlin
@@ -145,13 +148,11 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.6'
-
-      - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon
+      - name: Install Gradle 8.6 and Build Debug APK
+        run: |
+          curl -sL https://services.gradle.org/distributions/gradle-8.6-bin.zip -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /opt
+          /opt/gradle-8.6/bin/gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
